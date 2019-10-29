@@ -336,16 +336,12 @@ decl_module! {
         //cancel burn from validator
         fn cancel_transfer(origin, message_id: T::Hash) -> Result {
             let validator = ensure_signed(origin)?;
-            ensure!(Self::bridge_is_operational(), "Bridge is not operational");
-            Self::check_validator(validator)?;
+            Self::check_validator(validator.clone())?;
 
-            let mut message = <TransferMessages<T>>::get(message_id);
-            message.status = Status::Canceled;
-
-            <token::Module<T>>::unlock(&message.substrate_address, message.amount)?;
-            <TransferMessages<T>>::insert(message_id, message);
-            
-            Self::deposit_event(RawEvent::CancellationConfirmedMessage(message_id));
+            let id = <TransferId<T>>::get(message_id);
+            Self::update_status(message_id, Status::Canceled, Kind::Transfer)?;
+            Self::reopen_for_burn_confirmation(message_id)?;
+            Self::_sign(validator, id)?;
 
             Ok(())
         }
@@ -367,7 +363,7 @@ impl<T: Trait> Module<T> {
 
         if Self::votes_are_enough(transfer.votes) {
             match message.status {
-                Status::Confirmed => (), // if burn is confirmed
+                Status::Confirmed | Status::Canceled => (), // if burn is confirmed or canceled
                 _ => match transfer.kind {
                     Kind::Transfer => message.status = Status::Approved,
                     Kind::Limits => limit_message.status = Status::Approved,
@@ -384,7 +380,7 @@ impl<T: Trait> Module<T> {
             transfer.open = false;
         } else {
             match message.status {
-                Status::Confirmed => (),
+                Status::Confirmed | Status::Canceled => (),
                 _ => Self::set_pending(transfer_id, transfer.kind.clone())?,
             };
         }
@@ -400,7 +396,6 @@ impl<T: Trait> Module<T> {
         if !<TransferId<T>>::exists(transfer_hash) {
             Self::create_transfer(transfer_hash, kind)?;
         }
-
         Ok(())
     }
 
@@ -432,6 +427,10 @@ impl<T: Trait> Module<T> {
             message.amount,
         ));
         Self::update_status(message.message_id, Status::Approved, Kind::Transfer)
+    }
+    fn _cancel_transfer(message: TransferMessage<T::AccountId, T::Hash>) -> Result {
+        <token::Module<T>>::unlock(&message.substrate_address, message.amount)?;
+        Self::update_status(message.message_id, Status::Canceled, Kind::Transfer)
     }
     fn pause_the_bridge(message: BridgeMessage<T::AccountId, T::Hash>) -> Result {
         <BridgeIsOperational<T>>::mutate(|x| *x = false);
@@ -491,7 +490,7 @@ impl<T: Trait> Module<T> {
 
     /// check votes validity
     fn votes_are_enough(votes: MemberId) -> bool {
-        votes as f64 / Self::validators_count() as f64 >= 0.51
+        votes as f64 / f64::from(Self::validators_count()) >= 0.51
     }
 
     /// lock funds after set_transfer call
@@ -522,11 +521,13 @@ impl<T: Trait> Module<T> {
         match message.action {
             Status::Deposit => match message.status {
                 Status::Approved => Self::deposit(message),
+                Status::Canceled => Self::_cancel_transfer(message),
                 _ => Err("Tried to deposit with non-supported status"),
             },
             Status::Withdraw => match message.status {
                 Status::Confirmed => Self::execute_burn(message.message_id),
                 Status::Approved => Self::withdraw(message),
+                Status::Canceled => Self::_cancel_transfer(message),
                 _ => Err("Tried to withdraw with non-supported status"),
             },
             _ => Err("Tried to execute transfer with non-supported status"),
@@ -648,7 +649,9 @@ impl<T: Trait> Module<T> {
         let message = <TransferMessages<T>>::get(message_id);
         let transfer_id = <TransferId<T>>::get(message_id);
         let mut transfer = <BridgeTransfers<T>>::get(transfer_id);
-        if !transfer.open && message.status == Status::Confirmed {
+        let is_eth_response = message.status == Status::Confirmed || message.status == Status::Canceled;
+        
+        if !transfer.open && is_eth_response {
             transfer.votes = 0;
             transfer.open = true;
             <BridgeTransfers<T>>::insert(transfer_id, transfer);
@@ -1029,6 +1032,61 @@ mod tests {
                 BridgeModule::confirm_transfer(Origin::signed(V1), sub_message_id),
                 "This transfer must be approved first."
             );
+        })
+    }
+    #[test]
+    fn token_sub2eth_burn_cancel_works() {
+        with_externalities(&mut new_test_ext(), || {
+            let eth_message_id = H256::from(ETH_MESSAGE_ID);
+            let eth_address = H160::from(ETH_ADDRESS);
+            let amount1 = 999 * 10u128.pow(18);
+            let amount2 = 500 * 10u128.pow(18);
+
+            //substrate <----- ETH
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id,
+                eth_address,
+                USER2,
+                amount1
+            ));
+
+            //substrate ----> ETH
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER2),
+                eth_address,
+                amount2
+            ));
+
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(1);
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V2),
+                sub_message_id
+            ));
+            let mut message = BridgeModule::messages(sub_message_id);
+            // funds are locked and waiting for confirmation
+            assert_eq!(message.status, Status::Approved);
+            assert_ok!(BridgeModule::cancel_transfer(
+                Origin::signed(V2),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::cancel_transfer(
+                Origin::signed(V3),
+                sub_message_id
+            ));
+            message = BridgeModule::messages(sub_message_id);
+            assert_eq!(message.status, Status::Canceled);
         })
     }
     #[test]
