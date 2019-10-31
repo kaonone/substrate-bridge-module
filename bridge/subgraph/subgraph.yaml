@@ -43,4 +43,6 @@ dataSources:
           handler: handleConfirmMessage
         - event: ConfirmWithdrawMessage(bytes32,address,bytes32,uint256)
           handler: handleConfirmWithdrawMessage
+        - event: СancellationСonfirmedMessage(bytes32,address,bytes32,uint256)
+          handler: handleСancellationСonfirmedMessage
       file: ./src/mapping.ts

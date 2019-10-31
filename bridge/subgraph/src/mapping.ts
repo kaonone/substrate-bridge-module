@@ -11,6 +11,7 @@ import {
   ApprovedRelayMessage,
   ConfirmeMessage,
   ConfirmWithdrawMessage,
+  СancellationСonfirmedMessage,
   WithdrawTransferCall,
 } from "../generated/Contract/Contract"
 import { Message, Entry } from "../generated/schema"
@@ -51,6 +52,10 @@ export function handleConfirmMessage(event: ConfirmeMessage): void {
 
 export function handleConfirmWithdrawMessage(event: ConfirmWithdrawMessage): void {
   changeMessageStatus(event.params.messageID.toHex(), "CONFIRMED_WITHDRAW")
+}
+
+export function handleСancellationСonfirmedMessage(event: СancellationСonfirmedMessage): void {
+  changeMessageStatus(event.params.messageID.toHex(), "CANCELED")
 }
 
 export function handleBridgeStartedMessage(event: BridgeStartedMessage): void {
