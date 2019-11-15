@@ -1,4 +1,4 @@
-use erc20_substrate_bridge_runtime::{
+use polkadai_bridge_runtime::{
     AccountId, BalancesConfig, BridgeConfig, ConsensusConfig, ContractConfig, CouncilVotingConfig,
     DemocracyConfig, GenesisConfig, GrandpaConfig, IndicesConfig, Perbill, Permill, Schedule,
     SessionConfig, StakerStatus, StakingConfig, SudoConfig, TimestampConfig, TreasuryConfig,
@@ -124,7 +124,7 @@ fn testnet_genesis(
     ];
     GenesisConfig {
 		consensus: Some(ConsensusConfig {
-			code: include_bytes!("../runtime/wasm/target/wasm32-unknown-unknown/release/erc20_substrate_bridge_runtime_wasm.compact.wasm").to_vec(),
+			code: include_bytes!("../runtime/wasm/target/wasm32-unknown-unknown/release/polkadai_bridge_runtime_wasm.compact.wasm").to_vec(),
 			authorities: initial_authorities.clone(),
 		}),
 		system: None,
@@ -264,7 +264,7 @@ fn akropolis_staging_genesis() -> GenesisConfig {
 
     GenesisConfig {
 		consensus: Some(ConsensusConfig {
-			code: include_bytes!("../runtime/wasm/target/wasm32-unknown-unknown/release/erc20_substrate_bridge_runtime_wasm.compact.wasm").to_vec(),
+			code: include_bytes!("../runtime/wasm/target/wasm32-unknown-unknown/release/polkadai_bridge_runtime_wasm.compact.wasm").to_vec(),
 			authorities: initial_authorities.iter().cloned().map(|x| x.2).collect(),
 		}),
 		system: None,

@@ -2,4 +2,4 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
-pub use erc20_substrate_bridge_runtime::*;
+pub use polkadai_bridge_runtime::*;

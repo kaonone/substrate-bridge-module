@@ -50,6 +50,21 @@ pub enum Status {
 
 #[derive(Encode, Decode, Clone)]
 #[cfg_attr(feature = "std", derive(Debug))]
+pub enum BridgeLimits {
+    MinHostTransactionValue,
+    MaxHostTransactionValue,
+    DayHostMaxLimit,
+    DayHostMaxLimitForOneAddress,
+    MaxHostPendingTransactionLimit,
+    MinGuestTransactionValue,
+    MaxGuestTransactionValue,
+    DayGuestMaxLimit,
+    DayGuestMaxLimitForOneAddress,
+    MaxGuestPendingTransactionLimit,
+}
+
+#[derive(Encode, Decode, Clone)]
+#[cfg_attr(feature = "std", derive(Debug))]
 pub enum Kind {
     Transfer,
     Limits,

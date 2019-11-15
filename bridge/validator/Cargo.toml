@@ -20,7 +20,7 @@ graphql_client = "0.8.0"
 reqwest = "0.9.22"
 serde = "1.0.101"
 
-node-runtime = { path = '../../runtime/', package = 'erc20-substrate-bridge-runtime' }
+node-runtime = { path = '../../runtime/', package = 'polkadai-bridge-runtime' }
 
 substrate-bip39 = { path = 'vendor/substrate-bip39' }
 substrate-api-client = { path = 'vendor/substrate-api-client' }

@@ -54,11 +54,11 @@ cargo build
 
 ### 5. Build the validator node
 
-Follow the [validator README](https://github.com/akropolisio/erc20-substrate-bridge/blob/master/bridge/validator/README.md) instructions.
+Follow the [validator README](https://github.com/akropolisio/POC-polkadai-bridge/blob/master/bridge/validator/README.md) instructions.
 
 ### 6. Build frontend
 
-Follow the [frontend README](https://github.com/akropolisio/erc20-substrate-bridge/blob/master/bridge/frontend/README.md) instructions.
+Follow the [frontend README](https://github.com/akropolisio/POC-polkadai-bridge/blob/master/bridge/frontend/README.md) instructions.
 
 ### 4.(Optional) Tweak configuration to use your keys and account.
 
@@ -199,11 +199,11 @@ This guide will walk you through how to create an account and how to connect to 
 ```
 
 4) Create an account for each validator you want to launch. 
-Go to *Accounts* and generate new account(and modify validators mnemonic phrase in [ .env file](https://github.com/akropolisio/erc20-substrate-bridge/blob/master/bridge/validator/.env.example)) for each validator.
+Go to *Accounts* and generate new account(and modify validators mnemonic phrase in [ .env file](https://github.com/akropolisio/POC-polkadai-bridge/blob/master/bridge/validator/.env.example)) for each validator.
 
 5) Repeat step 4 for each validator in case you have more than one.
 
-6) Modify validators in [chain_spec.rs](https://github.com/akropolisio/erc20-substrate-bridge/blob/master/src/chain_spec.rs) in GenesisConfig -> bridge
+6) Modify validators in [chain_spec.rs](https://github.com/akropolisio/POC-polkadai-bridge/blob/master/src/chain_spec.rs) in GenesisConfig -> bridge
 
 7) Repeat Build + Run instructions 
 

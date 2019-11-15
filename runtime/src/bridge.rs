@@ -1,4 +1,4 @@
-/// runtime module implementing Substrate side of Erc20SubstrateBridge token exchange bridge
+/// runtime module implementing Substrate side of PolkadaiBridge token exchange bridge
 /// You can use mint to create tokens backed by locked funds on Ethereum side
 /// and transfer tokens on substrate side freely
 ///
@@ -672,6 +672,7 @@ impl<T: Trait> Module<T> {
 
         Ok(())
     }
+
     fn check_amount(amount: TokenBalance) -> Result {
         let token = <token::Module<T>>::token_default();
         let max = <MaxLimit<T>>::get() * 10u128.pow(token.decimals.into());
