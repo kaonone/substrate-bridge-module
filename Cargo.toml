@@ -3,7 +3,7 @@ authors = ['Akropolis <admin@akropolis.io>']
 build = 'build.rs'
 edition = '2018'
 name = 'polkadai-bridge'
-version = '0.0.2'
+version = '0.0.3'
 
 [dependencies]
 error-chain = '0.12'
