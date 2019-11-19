@@ -4,12 +4,12 @@
 ///
 use crate::token;
 use crate::types::{
-    BridgeMessage, BridgeTransfer, Kind, LimitMessage, MemberId, ProposalId, Status, TokenBalance,
-    TransferMessage, ValidatorMessage,
+    BridgeMessage, BridgeTransfer, Kind, LimitMessage, Limits, MemberId, ProposalId, Status,
+    TokenBalance, TransferMessage, ValidatorMessage,
 };
-use rstd::prelude::Vec;
 use parity_codec::Encode;
 use primitives::H160;
+use rstd::prelude::Vec;
 use runtime_primitives::traits::{As, Hash};
 use support::{
     decl_event, decl_module, decl_storage, dispatch::Result, ensure, fail, StorageMap, StorageValue,
@@ -32,7 +32,7 @@ decl_event!(
     }
 );
 
-pub trait Trait: token::Trait + system::Trait {
+pub trait Trait: token::Trait + system::Trait + timestamp::Trait {
     type Event: From<Event<Self>> + Into<<Self as system::Trait>::Event>;
 }
 
@@ -41,13 +41,19 @@ decl_storage! {
         BridgeIsOperational get(bridge_is_operational): bool = true;
         BridgeMessages get(bridge_messages): map (T::Hash) => BridgeMessage<T::AccountId, T::Hash>;
 
-        MaxLimit get(max_tx_limit): TokenBalance = 1000;
-        MinLimit get(min_tx_limit): TokenBalance = 10;
+        // limits change history
         LimitMessages get(limit_messages): map(T::Hash) => LimitMessage<T::Hash>;
-        PendingBurnLimit get(pending_burn_limit) config(): u128;
-        PendingMintLimit get(pending_mint_limit) config(): u128;
-        PendingBurnCount get(pending_burn_count): u128;
-        PendingMintCount get(pending_mint_count): u128;
+        CurrentLimits get(current_limits): Limits = Limits {
+            max_tx_value: 100*10u128.pow(18),
+            day_max_limit: 200*10u128.pow(18),
+            day_max_limit_for_one_address: 50*10u128.pow(18),
+            max_pending_tx_limit: 400*10u128.pow(18),
+            min_tx_value: 10*10u128.pow(18),
+        };
+
+        // open transactions
+        CurrentPendingBurn get(pending_burn_count): u128;
+        CurrentPendingMint get(pending_mint_count): u128;
 
         BridgeTransfers get(transfers): map ProposalId => BridgeTransfer<T::Hash>;
         BridgeTransfersCount get(bridge_transfers_count): ProposalId;
@@ -78,13 +84,14 @@ decl_module! {
         {
             let from = ensure_signed(origin)?;
             ensure!(Self::bridge_is_operational(), "Bridge is not operational");
-            let can_burn = <PendingBurnCount<T>>::get() < <PendingBurnLimit<T>>::get();
-            ensure!(can_burn, "Too many pending burn transactions.");
+
+
+            Self::check_pending_burn(amount)?;
             Self::check_amount(amount)?;
 
-            let transfer_hash = (&from, &to, amount, T::BlockNumber::sa(0)).using_encoded(<T as system::Trait>::Hashing::hash);
+            let transfer_hash = (&from, &to, amount, <timestamp::Module<T>>::get()).using_encoded(<T as system::Trait>::Hashing::hash);
 
-            let message = TransferMessage{
+            let message = TransferMessage {
                 message_id: transfer_hash,
                 eth_address: to,
                 substrate_address: from,
@@ -103,10 +110,9 @@ decl_module! {
         fn multi_signed_mint(origin, message_id: T::Hash, from: H160, to: T::AccountId, #[compact] amount: TokenBalance)-> Result {
             let validator = ensure_signed(origin)?;
             ensure!(Self::bridge_is_operational(), "Bridge is not operational");
-            let can_mint = <PendingMintCount<T>>::get() < <PendingMintLimit<T>>::get();
-            ensure!(can_mint, "Too many pending mint transactions.");
 
             Self::check_validator(validator.clone())?;
+            Self::check_pending_mint(amount)?;
             Self::check_amount(amount)?;
 
             if !<TransferMessages<T>>::exists(message_id) {
@@ -125,89 +131,32 @@ decl_module! {
             let transfer_id = <TransferId<T>>::get(message_id);
             Self::_sign(validator, transfer_id)
         }
-        // change minimum tx limit
-        fn change_min_limit(origin, message_id: T::Hash, #[compact] amount: TokenBalance)-> Result {
-            let validator = ensure_signed(origin)?;
-            ensure!(Self::bridge_is_operational(), "Bridge is not operational");
-            Self::check_validator(validator.clone())?;
-            Self::check_limit(amount)?;
-
-            if !<LimitMessages<T>>::exists(message_id) {
-                let message = LimitMessage{
-                    message_id,
-                    amount,
-                    action: Status::ChangeMinTx,
-                    status: Status::ChangeMinTx,
-                };
-                <LimitMessages<T>>::insert(message_id, message);
-                Self::get_transfer_id_checked(message_id, Kind::Limits)?;
-            }
-
-            let transfer_id = <TransferId<T>>::get(message_id);
-            Self::_sign(validator, transfer_id)
-        }
 
         // change maximum tx limit
-        fn change_max_limit(origin, message_id: T::Hash, #[compact] amount: TokenBalance)-> Result {
+        fn update_limits(origin, max_tx_value: u128, day_max_limit: u128, day_max_limit_for_one_address: u128, max_pending_tx_limit: u128,min_tx_value: u128)-> Result {
             let validator = ensure_signed(origin)?;
-            ensure!(Self::bridge_is_operational(), "Bridge is not operational");
             Self::check_validator(validator.clone())?;
-            Self::check_limit(amount)?;
+            let limits = Limits{
+                max_tx_value,
+                day_max_limit,
+                day_max_limit_for_one_address,
+                max_pending_tx_limit,
+                min_tx_value,
+            };
+            Self::check_limits(&limits)?;
+            let id = (limits.clone(), T::BlockNumber::sa(0)).using_encoded(<T as system::Trait>::Hashing::hash);
 
-            if !<LimitMessages<T>>::exists(message_id) {
-                let message = LimitMessage{
-                    message_id,
-                    amount,
-                    action: Status::ChangeMaxTx,
-                    status: Status::ChangeMaxTx,
+            if !<LimitMessages<T>>::exists(id) {
+                let message = LimitMessage {
+                    id,
+                    limits,
+                    status: Status::UpdateLimits,
                 };
-                <LimitMessages<T>>::insert(message_id, message);
-                Self::get_transfer_id_checked(message_id, Kind::Limits)?;
+                <LimitMessages<T>>::insert(id, message);
+                Self::get_transfer_id_checked(id, Kind::Limits)?;
             }
 
-            let transfer_id = <TransferId<T>>::get(message_id);
-            Self::_sign(validator, transfer_id)
-        }
-
-        // set maximum pending burn transaction limit
-        fn set_pending_burn_limit(origin, message_id: T::Hash, #[compact] amount: TokenBalance)-> Result {
-            let validator = ensure_signed(origin)?;
-            ensure!(Self::bridge_is_operational(), "Bridge is not operational");
-            Self::check_validator(validator.clone())?;
-
-            if !<LimitMessages<T>>::exists(message_id) {
-                let message = LimitMessage{
-                    message_id,
-                    amount,
-                    action: Status::ChangePendingBurnLimit,
-                    status: Status::ChangePendingBurnLimit,
-                };
-                <LimitMessages<T>>::insert(message_id, message);
-                Self::get_transfer_id_checked(message_id, Kind::Limits)?;
-            }
-
-            let transfer_id = <TransferId<T>>::get(message_id);
-            Self::_sign(validator, transfer_id)
-        }
-
-        // set maximum pending mint transaction limit
-        fn set_pending_mint_limit(origin, message_id: T::Hash, #[compact] amount: TokenBalance)-> Result {
-            let validator = ensure_signed(origin)?;
-            ensure!(Self::bridge_is_operational(), "Bridge is not operational");
-            Self::check_validator(validator.clone())?;
-
-            if !<LimitMessages<T>>::exists(message_id) {
-                let message = LimitMessage{
-                    message_id,
-                    amount,
-                    action: Status::ChangePendingMintLimit,
-                    status: Status::ChangePendingMintLimit,
-                };
-                <LimitMessages<T>>::insert(message_id, message);
-                Self::get_transfer_id_checked(message_id, Kind::Limits)?;
-            }
-
-            let transfer_id = <TransferId<T>>::get(message_id);
+            let transfer_id = <TransferId<T>>::get(id);
             Self::_sign(validator, transfer_id)
         }
 
@@ -376,7 +325,7 @@ impl<T: Trait> Module<T> {
             }
             match transfer.kind {
                 Kind::Transfer => Self::execute_transfer(message)?,
-                Kind::Limits => Self::manage_limits(limit_message)?,
+                Kind::Limits => Self::_update_limits(limit_message)?,
                 Kind::Validator => Self::manage_validator(validator_message)?,
                 Kind::Bridge => Self::manage_bridge(bridge_message)?,
             }
@@ -404,9 +353,8 @@ impl<T: Trait> Module<T> {
     }
 
     fn deposit(message: TransferMessage<T::AccountId, T::Hash>) -> Result {
+        Self::sub_pending_mint(message.clone())?;
         let to = message.substrate_address;
-
-        <PendingMintCount<T>>::mutate(|c| *c -= 1);
         if !<DailyHolds<T>>::exists(&to) {
             <DailyHolds<T>>::insert(to.clone(), (T::BlockNumber::sa(0), message.message_id));
         }
@@ -419,7 +367,7 @@ impl<T: Trait> Module<T> {
 
     fn withdraw(message: TransferMessage<T::AccountId, T::Hash>) -> Result {
         Self::check_daily_holds(message.clone())?;
-        <PendingBurnCount<T>>::mutate(|c| *c -= 1);
+        Self::sub_pending_burn(message.clone())?;
 
         let to = message.eth_address;
         let from = message.substrate_address;
@@ -442,26 +390,42 @@ impl<T: Trait> Module<T> {
         Self::update_status(message.message_id, Status::Confirmed, Kind::Bridge)
     }
 
-    fn _change_max_limit(message: LimitMessage<T::Hash>) -> Result {
-        Self::check_limit(message.amount)?;
-        <MaxLimit<T>>::put(message.amount);
-        Self::update_status(message.message_id, Status::Confirmed, Kind::Limits)
+    fn _update_limits(message: LimitMessage<T::Hash>) -> Result {
+        Self::check_limits(&message.limits)?;
+        <CurrentLimits<T>>::put(message.limits);
+        Self::update_status(message.id, Status::Confirmed, Kind::Limits)
     }
-
-    fn _change_min_limit(message: LimitMessage<T::Hash>) -> Result {
-        Self::check_limit(message.amount)?;
-        <MinLimit<T>>::put(message.amount);
-        Self::update_status(message.message_id, Status::Confirmed, Kind::Limits)
+    fn add_pending_burn(message: TransferMessage<T::AccountId, T::Hash>) -> Result {
+        let current = <CurrentPendingBurn<T>>::get();
+        let next = current
+            .checked_add(message.amount)
+            .ok_or("Overflow adding to new pending burn volume")?;
+        <CurrentPendingBurn<T>>::put(next);
+        Ok(())
     }
-
-    fn _change_pending_burn_limit(message: LimitMessage<T::Hash>) -> Result {
-        <PendingBurnLimit<T>>::put(message.amount);
-        Self::update_status(message.message_id, Status::Confirmed, Kind::Limits)
+    fn add_pending_mint(message: TransferMessage<T::AccountId, T::Hash>) -> Result {
+        let current = <CurrentPendingMint<T>>::get();
+        let next = current
+            .checked_add(message.amount)
+            .ok_or("Overflow adding to new pending mint volume")?;
+        <CurrentPendingMint<T>>::put(next);
+        Ok(())
     }
-
-    fn _change_pending_mint_limit(message: LimitMessage<T::Hash>) -> Result {
-        <PendingMintLimit<T>>::put(message.amount);
-        Self::update_status(message.message_id, Status::Confirmed, Kind::Limits)
+    fn sub_pending_burn(message: TransferMessage<T::AccountId, T::Hash>) -> Result {
+        let current = <CurrentPendingBurn<T>>::get();
+        let next = current
+            .checked_sub(message.amount)
+            .ok_or("Overflow subtracting to new pending burn volume")?;
+        <CurrentPendingBurn<T>>::put(next);
+        Ok(())
+    }
+    fn sub_pending_mint(message: TransferMessage<T::AccountId, T::Hash>) -> Result {
+        let current = <CurrentPendingMint<T>>::get();
+        let next = current
+            .checked_sub(message.amount)
+            .ok_or("Overflow subtracting to new pending mint volume")?;
+        <CurrentPendingMint<T>>::put(next);
+        Ok(())
     }
 
     /// add validator
@@ -560,28 +524,6 @@ impl<T: Trait> Module<T> {
         }
     }
 
-    fn manage_limits(message: LimitMessage<T::Hash>) -> Result {
-        match message.action {
-            Status::ChangeMinTx => match message.status {
-                Status::Approved => Self::_change_min_limit(message),
-                _ => Err("Tried to pause the bridge with non-supported status"),
-            },
-            Status::ChangeMaxTx => match message.status {
-                Status::Approved => Self::_change_max_limit(message),
-                _ => Err("Tried to resume the bridge with non-supported status"),
-            },
-            Status::ChangePendingBurnLimit => match message.status {
-                Status::Approved => Self::_change_pending_burn_limit(message),
-                _ => Err("Tried to change pending burn limit with non-supported status"),
-            },
-            Status::ChangePendingMintLimit => match message.status {
-                Status::Approved => Self::_change_pending_mint_limit(message),
-                _ => Err("Tried to change pending mint limit with non-supported status"),
-            },
-            _ => Err("Tried to manage bridge with non-supported status"),
-        }
-    }
-
     fn create_transfer(transfer_hash: T::Hash, kind: Kind) -> Result {
         ensure!(
             !<TransferId<T>>::exists(transfer_hash),
@@ -614,8 +556,8 @@ impl<T: Trait> Module<T> {
             Kind::Transfer => {
                 let message = <TransferMessages<T>>::get(message_id);
                 match message.action {
-                    Status::Withdraw => <PendingBurnCount<T>>::mutate(|c| *c += 1),
-                    Status::Deposit => <PendingMintCount<T>>::mutate(|c| *c += 1),
+                    Status::Withdraw => Self::add_pending_burn(message)?,
+                    Status::Deposit => Self::add_pending_mint(message)?,
                     _ => (),
                 }
             }
@@ -674,9 +616,8 @@ impl<T: Trait> Module<T> {
     }
 
     fn check_amount(amount: TokenBalance) -> Result {
-        let token = <token::Module<T>>::token_default();
-        let max = <MaxLimit<T>>::get() * 10u128.pow(token.decimals.into());
-        let min = <MinLimit<T>>::get() * 10u128.pow(token.decimals.into());
+        let max = <CurrentLimits<T>>::get().max_tx_value;
+        let min = <CurrentLimits<T>>::get().min_tx_value;
 
         ensure!(
             amount > min,
@@ -689,13 +630,38 @@ impl<T: Trait> Module<T> {
 
         Ok(())
     }
+    //open transactions check
+    fn check_pending_burn(amount: TokenBalance) -> Result {
+        let new_pending_volume = <CurrentPendingBurn<T>>::get()
+            .checked_add(amount)
+            .ok_or("Overflow adding to new pending burn volume")?;
+        let can_burn = new_pending_volume < <CurrentLimits<T>>::get().max_pending_tx_limit;
+        ensure!(can_burn, "Too many pending burn transactions.");
+        Ok(())
+    }
+    fn check_pending_mint(amount: TokenBalance) -> Result {
+        let new_pending_volume = <CurrentPendingMint<T>>::get()
+            .checked_add(amount)
+            .ok_or("Overflow adding to new pending mint volume")?;
+        let can_burn = new_pending_volume < <CurrentLimits<T>>::get().max_pending_tx_limit;
+        ensure!(can_burn, "Too many pending mint transactions.");
+        Ok(())
+    }
 
-    fn check_limit(amount: TokenBalance) -> Result {
+    fn check_limits(limits: &Limits) -> Result {
         let max = u128::max_value();
         let min = u128::min_value();
-        ensure!(amount < max, "Overflow setting limit");
-        ensure!(amount > min, "Underflow setting limit");
-
+        let passed = limits
+            .into_array()
+            .iter()
+            .fold((true, true), |acc, l| match acc {
+                (true, true) => (l < &max, l > &min),
+                (true, false) => (l < &max, false),
+                (false, true) => (false, l > &min),
+                (_, _) => acc,
+            });
+        ensure!(passed.0, "Overflow setting limit");
+        ensure!(passed.1, "Underflow setting limit");
         Ok(())
     }
 
@@ -786,6 +752,9 @@ mod tests {
     const ETH_MESSAGE_ID: &[u8; 32] = b"0x5617efe391571b5dc8230db92ba65b";
     const ETH_MESSAGE_ID2: &[u8; 32] = b"0x5617yhk391571b5dc8230db92ba65b";
     const ETH_MESSAGE_ID3: &[u8; 32] = b"0x5617jdp391571b5dc8230db92ba65b";
+    const ETH_MESSAGE_ID4: &[u8; 32] = b"0x5617kpt391571b5dc8230db92ba65b";
+    const ETH_MESSAGE_ID5: &[u8; 32] = b"0x5617oet391571b5dc8230db92ba65b";
+    const ETH_MESSAGE_ID6: &[u8; 32] = b"0x5617uem391571b5dc8230db92ba65b";
     const ETH_ADDRESS: &[u8; 20] = b"0x00b46c2526ebb8f4c9";
     const V1: u64 = 1;
     const V2: u64 = 2;
@@ -827,8 +796,6 @@ mod tests {
             GenesisConfig::<Test> {
                 validators_count: 3u32,
                 validator_accounts: vec![V1, V2, V3],
-                pending_burn_limit: 2,
-                pending_mint_limit: 2,
             }
             .build_storage()
             .unwrap()
@@ -843,7 +810,7 @@ mod tests {
         with_externalities(&mut new_test_ext(), || {
             let message_id = H256::from(ETH_MESSAGE_ID);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount = 999 * 10u128.pow(18);
+            let amount = 99 * 10u128.pow(18);
 
             //substrate <----- ETH
             assert_ok!(BridgeModule::multi_signed_mint(
@@ -878,7 +845,7 @@ mod tests {
         with_externalities(&mut new_test_ext(), || {
             let message_id = H256::from(ETH_MESSAGE_ID);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount = 999 * 10u128.pow(18);
+            let amount = 99 * 10u128.pow(18);
 
             //substrate <----- ETH
             assert_ok!(BridgeModule::multi_signed_mint(
@@ -920,8 +887,8 @@ mod tests {
         with_externalities(&mut new_test_ext(), || {
             let eth_message_id = H256::from(ETH_MESSAGE_ID);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount1 = 999 * 10u128.pow(18);
-            let amount2 = 500 * 10u128.pow(18);
+            let amount1 = 99 * 10u128.pow(18);
+            let amount2 = 50 * 10u128.pow(18);
 
             //substrate <----- ETH
             assert_ok!(BridgeModule::multi_signed_mint(
@@ -998,8 +965,8 @@ mod tests {
         with_externalities(&mut new_test_ext(), || {
             let eth_message_id = H256::from(ETH_MESSAGE_ID);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount1 = 999 * 10u128.pow(18);
-            let amount2 = 500 * 10u128.pow(18);
+            let amount1 = 99 * 10u128.pow(18);
+            let amount2 = 50 * 10u128.pow(18);
             //substrate <----- ETH
             assert_ok!(BridgeModule::multi_signed_mint(
                 Origin::signed(V2),
@@ -1161,79 +1128,12 @@ mod tests {
         })
     }
     #[test]
-    fn change_min_limit_should_work() {
-        with_externalities(&mut new_test_ext(), || {
-            const LESS_THAN_MINIMUM: u128 = 5;
-            let message_id = H256::from(ETH_MESSAGE_ID);
-
-            assert_eq!(BridgeModule::min_tx_limit(), 10);
-            assert_ok!(BridgeModule::change_min_limit(
-                Origin::signed(V2),
-                message_id,
-                LESS_THAN_MINIMUM
-            ));
-            assert_ok!(BridgeModule::change_min_limit(
-                Origin::signed(V1),
-                message_id,
-                LESS_THAN_MINIMUM
-            ));
-            assert_eq!(BridgeModule::min_tx_limit(), LESS_THAN_MINIMUM);
-        })
-    }
-    #[test]
-    fn change_max_limit_should_work() {
-        with_externalities(&mut new_test_ext(), || {
-            const MORE_THAN_MAX: u128 = 10000;
-            let message_id = H256::from(ETH_MESSAGE_ID);
-
-            assert_eq!(BridgeModule::max_tx_limit(), 1000);
-            assert_ok!(BridgeModule::change_max_limit(
-                Origin::signed(V2),
-                message_id,
-                MORE_THAN_MAX
-            ));
-            assert_ok!(BridgeModule::change_max_limit(
-                Origin::signed(V1),
-                message_id,
-                MORE_THAN_MAX
-            ));
-            assert_eq!(BridgeModule::max_tx_limit(), MORE_THAN_MAX);
-        })
-    }
-    #[test]
-    fn change_min_limit_should_fail() {
-        with_externalities(&mut new_test_ext(), || {
-            const LESS_THAN_MINIMUM: u128 = u128::min_value();
-            let message_id = H256::from(ETH_MESSAGE_ID);
-
-            assert_eq!(BridgeModule::min_tx_limit(), 10);
-            assert_noop!(
-                BridgeModule::change_min_limit(Origin::signed(V2), message_id, LESS_THAN_MINIMUM),
-                "Underflow setting limit"
-            );
-        })
-    }
-    #[test]
-    fn change_max_limit_should_fail() {
-        with_externalities(&mut new_test_ext(), || {
-            const MORE_THAN_MAX: u128 = u128::max_value();
-            let message_id = H256::from(ETH_MESSAGE_ID);
-
-            assert_eq!(BridgeModule::max_tx_limit(), 1000);
-            assert_noop!(
-                BridgeModule::change_max_limit(Origin::signed(V2), message_id, MORE_THAN_MAX),
-                "Overflow setting limit"
-            );
-        })
-    }
-    #[test]
     fn instant_withdraw_should_fail() {
         with_externalities(&mut new_test_ext(), || {
             let eth_message_id = H256::from(ETH_MESSAGE_ID);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount1 = 999 * 10u128.pow(18);
-            let amount2 = 900 * 10u128.pow(18);
-
+            let amount1 = 99 * 10u128.pow(18);
+            let amount2 = 90 * 10u128.pow(18);
             //substrate <----- ETH
             assert_ok!(BridgeModule::multi_signed_mint(
                 Origin::signed(V2),
@@ -1249,7 +1149,6 @@ mod tests {
                 USER2,
                 amount1
             ));
-
             //substrate ----> ETH
             assert_ok!(BridgeModule::set_transfer(
                 Origin::signed(USER2),
@@ -1257,20 +1156,16 @@ mod tests {
                 amount2
             ));
             //RelayMessage(message_id) event emitted
-
             let sub_message_id = BridgeModule::message_id_by_transfer_id(1);
             let get_message = || BridgeModule::messages(sub_message_id);
-
             let mut message = get_message();
             assert_eq!(message.status, Status::Withdraw);
-
             //approval
             assert_eq!(TokenModule::locked(USER2), 0);
             assert_ok!(BridgeModule::approve_transfer(
                 Origin::signed(V1),
                 sub_message_id
             ));
-
             // assert_noop BUG: fails through different root hashes
             // assert_noop!(
             //     BridgeModule::approve_transfer(Origin::signed(V2), sub_message_id),
@@ -1284,55 +1179,81 @@ mod tests {
         })
     }
     #[test]
-    fn change_pending_burn_limit_should_work() {
+    fn change_limits_should_work() {
         with_externalities(&mut new_test_ext(), || {
-            let eth_message_id = H256::from(ETH_MESSAGE_ID);
-            const AMOUNT1: u128 = 5;
+            let max_tx_value = 10 * 10u128.pow(18);
+            let day_max_limit = 20 * 10u128.pow(18);
+            let day_max_limit_for_one_address = 5 * 10u128.pow(18);
+            let max_pending_tx_limit = 40 * 10u128.pow(18);
+            let min_tx_value = 1 * 10u128.pow(18);
 
-            assert_eq!(BridgeModule::pending_burn_limit(), 2);
-            assert_ok!(BridgeModule::set_pending_burn_limit(
+            assert_eq!(
+                BridgeModule::current_limits().max_tx_value,
+                100 * 10u128.pow(18)
+            );
+            assert_ok!(BridgeModule::update_limits(
                 Origin::signed(V2),
-                eth_message_id,
-                AMOUNT1
+                max_tx_value,
+                day_max_limit,
+                day_max_limit_for_one_address,
+                max_pending_tx_limit,
+                min_tx_value,
             ));
-            assert_ok!(BridgeModule::set_pending_burn_limit(
+            assert_ok!(BridgeModule::update_limits(
                 Origin::signed(V1),
-                eth_message_id,
-                AMOUNT1
+                max_tx_value,
+                day_max_limit,
+                day_max_limit_for_one_address,
+                max_pending_tx_limit,
+                min_tx_value,
             ));
 
-            assert_eq!(BridgeModule::pending_burn_limit(), 5);
+            assert_eq!(
+                BridgeModule::current_limits().max_tx_value,
+                10 * 10u128.pow(18)
+            );
         })
     }
     #[test]
-    fn change_pending_mint_limit_should_work() {
+    fn change_limits_should_fail() {
         with_externalities(&mut new_test_ext(), || {
-            let eth_message_id = H256::from(ETH_MESSAGE_ID);
-            const AMOUNT1: u128 = 5;
+            let day_max_limit = 20 * 10u128.pow(18);
+            let day_max_limit_for_one_address = 5 * 10u128.pow(18);
+            let max_pending_tx_limit = 40 * 10u128.pow(18);
+            let min_tx_value = 1 * 10u128.pow(18);
+            const MORE_THAN_MAX: u128 = u128::max_value();
 
-            assert_eq!(BridgeModule::pending_mint_limit(), 2);
-            assert_ok!(BridgeModule::set_pending_mint_limit(
-                Origin::signed(V2),
-                eth_message_id,
-                AMOUNT1
-            ));
-            assert_ok!(BridgeModule::set_pending_mint_limit(
-                Origin::signed(V1),
-                eth_message_id,
-                AMOUNT1
-            ));
-
-            assert_eq!(BridgeModule::pending_mint_limit(), 5);
+            assert_eq!(
+                BridgeModule::current_limits().max_tx_value,
+                100 * 10u128.pow(18)
+            );
+            assert_noop!(
+                BridgeModule::update_limits(
+                    Origin::signed(V1),
+                    MORE_THAN_MAX,
+                    day_max_limit,
+                    day_max_limit_for_one_address,
+                    max_pending_tx_limit,
+                    min_tx_value,
+                ),
+                "Overflow setting limit"
+            );
         })
     }
     #[test]
     fn pending_burn_limit_should_work() {
         with_externalities(&mut new_test_ext(), || {
             let eth_message_id = H256::from(ETH_MESSAGE_ID);
+            let eth_message_id2 = H256::from(ETH_MESSAGE_ID2);
+            let eth_message_id3 = H256::from(ETH_MESSAGE_ID3);
+            let eth_message_id4 = H256::from(ETH_MESSAGE_ID4);
+            let eth_message_id5 = H256::from(ETH_MESSAGE_ID5);
+            let eth_message_id6 = H256::from(ETH_MESSAGE_ID6);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount1 = 999 * 10u128.pow(18);
-            let amount2 = 900 * 10u128.pow(18);
+            let amount1 = 99 * 10u128.pow(18);
+            let amount2 = 50 * 10u128.pow(18);
 
+            //TODO: move limits to chain_spec
             assert_ok!(BridgeModule::multi_signed_mint(
                 Origin::signed(V2),
                 eth_message_id,
@@ -1347,34 +1268,124 @@ mod tests {
                 USER2,
                 amount1
             ));
-
+            //& delete this afterwards
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id2,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id2,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id3,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id3,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id4,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id4,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id5,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id5,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id6,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id6,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            // to delete ^
             assert_ok!(BridgeModule::set_transfer(
                 Origin::signed(USER2),
                 eth_address,
                 amount1
             ));
-            let sub_message_id = BridgeModule::message_id_by_transfer_id(1);
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(6);
             assert_ok!(BridgeModule::approve_transfer(
                 Origin::signed(V1),
                 sub_message_id
             ));
-
-            assert_eq!(BridgeModule::pending_burn_count(), 1);
+            //TODO: delete
             assert_ok!(BridgeModule::set_transfer(
                 Origin::signed(USER2),
                 eth_address,
-                amount2
+                amount1 + 1
             ));
-
-            let sub_message_id2 = BridgeModule::message_id_by_transfer_id(2);
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(7);
             assert_ok!(BridgeModule::approve_transfer(
-                Origin::signed(V2),
-                sub_message_id2
+                Origin::signed(V1),
+                sub_message_id
             ));
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER2),
+                eth_address,
+                amount1 + 2
+            ));
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(8);
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER2),
+                eth_address,
+                amount1 + 3
+            ));
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(9);
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            //TODO: delete ^
 
-            assert_eq!(BridgeModule::pending_burn_count(), 2);
+            assert_eq!(BridgeModule::pending_burn_count(), amount1 * 4 + 6);
             assert_noop!(
-                BridgeModule::set_transfer(Origin::signed(USER2), eth_address, amount1 - amount2),
+                BridgeModule::set_transfer(Origin::signed(USER2), eth_address, amount2),
                 "Too many pending burn transactions."
             );
         })
@@ -1385,9 +1396,10 @@ mod tests {
             let eth_message_id = H256::from(ETH_MESSAGE_ID);
             let eth_message_id2 = H256::from(ETH_MESSAGE_ID2);
             let eth_message_id3 = H256::from(ETH_MESSAGE_ID3);
+            let eth_message_id4 = H256::from(ETH_MESSAGE_ID4);
+            let eth_message_id5 = H256::from(ETH_MESSAGE_ID5);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount1 = 999 * 10u128.pow(18);
-            let amount2 = 900 * 10u128.pow(18);
+            let amount1 = 99 * 10u128.pow(18);
 
             //substrate <----- ETH
             assert_ok!(BridgeModule::multi_signed_mint(
@@ -1404,17 +1416,36 @@ mod tests {
                 eth_message_id2,
                 eth_address,
                 USER2,
-                amount2
+                amount1 + 1
             ));
+
+            //substrate <----- ETH
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id3,
+                eth_address,
+                USER2,
+                amount1 + 2
+            ));
+
+            //substrate <----- ETH
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id4,
+                eth_address,
+                USER2,
+                amount1 + 3
+            ));
+            assert_eq!(BridgeModule::pending_mint_count(), amount1 * 4 + 6);
 
             //substrate <----- ETH
             assert_noop!(
                 BridgeModule::multi_signed_mint(
                     Origin::signed(V2),
-                    eth_message_id3,
+                    eth_message_id5,
                     eth_address,
                     USER2,
-                    amount1 - amount2
+                    amount1 + 5
                 ),
                 "Too many pending mint transactions."
             );
