@@ -5,7 +5,7 @@
 use crate::token;
 use crate::types::{
     BridgeMessage, BridgeTransfer, Kind, LimitMessage, Limits, MemberId, ProposalId, Status,
-    TokenBalance, TransferMessage, ValidatorMessage,
+    TokenBalance, TransferMessage,
 };
 use parity_codec::Encode;
 use primitives::H160;
@@ -27,6 +27,7 @@ decl_event!(
     {
         RelayMessage(Hash),
         ApprovedRelayMessage(Hash, AccountId, H160, TokenBalance),
+        CancellationConfirmedMessage(Hash),
         MintedMessage(Hash),
         BurnedMessage(Hash, AccountId, H160, TokenBalance),
     }
@@ -65,7 +66,7 @@ decl_storage! {
 
         ValidatorsCount get(validators_count) config(): u32 = 3;
         ValidatorVotes get(validator_votes): map(ProposalId, T::AccountId) => bool;
-        ValidatorHistory get(validator_history): map (T::Hash) => ValidatorMessage<T::AccountId, T::Hash>;
+        ValidatorHistory get(validator_history): map (T::Hash) => BridgeMessage<T::AccountId, T::Hash>;
         Validators get(validators) build(|config: &GenesisConfig<T>| {
             config.validator_accounts.clone().into_iter()
             .map(|acc: T::AccountId| (acc, true)).collect::<Vec<_>>()
@@ -173,14 +174,13 @@ decl_module! {
         // each validator calls it to add new validator
         fn add_validator(origin, address: T::AccountId) -> Result {
             let validator = ensure_signed(origin)?;
-            ensure!(Self::bridge_is_operational(), "Bridge is not operational");
             Self::check_validator(validator.clone())?;
 
             ensure!(<ValidatorsCount<T>>::get() < 100_000, "Validators maximum reached.");
             let hash = ("add", &address).using_encoded(<T as system::Trait>::Hashing::hash);
 
             if !<ValidatorHistory<T>>::exists(hash) {
-                let message = ValidatorMessage {
+                let message = BridgeMessage {
                     message_id: hash,
                     account: address,
                     action: Status::AddValidator,
@@ -197,7 +197,6 @@ decl_module! {
         // each validator calls it to remove new validator
         fn remove_validator(origin, address: T::AccountId) -> Result {
             let validator = ensure_signed(origin)?;
-            ensure!(Self::bridge_is_operational(), "Bridge is not operational");
             Self::check_validator(validator.clone())?;
 
             ensure!(<ValidatorsCount<T>>::get() > 1, "Can not remove last validator.");
@@ -205,7 +204,7 @@ decl_module! {
             let hash = ("remove", &address).using_encoded(<T as system::Trait>::Hashing::hash);
 
             if !<ValidatorHistory<T>>::exists(hash) {
-                let message = ValidatorMessage {
+                let message = BridgeMessage {
                     message_id: hash,
                     account: address,
                     action: Status::RemoveValidator,
@@ -286,14 +285,15 @@ decl_module! {
         //cancel burn from validator
         fn cancel_transfer(origin, message_id: T::Hash) -> Result {
             let validator = ensure_signed(origin)?;
-            ensure!(Self::bridge_is_operational(), "Bridge is not operational");
-            Self::check_validator(validator)?;
+            Self::check_validator(validator.clone())?;
 
-            let mut message = <TransferMessages<T>>::get(message_id);
-            message.status = Status::Canceled;
+            let has_burned = <TransferMessages<T>>::exists(message_id) && <TransferMessages<T>>::get(message_id).status == Status::Confirmed;
+            ensure!(!has_burned, "Failed to cancel. This transfer is already executed.");
 
-            <token::Module<T>>::unlock(&message.substrate_address, message.amount)?;
-            <TransferMessages<T>>::insert(message_id, message);
+            let id = <TransferId<T>>::get(message_id);
+            Self::update_status(message_id, Status::Canceled, Kind::Transfer)?;
+            Self::reopen_for_burn_confirmation(message_id)?;
+            Self::_sign(validator, id)?;
 
             Ok(())
         }
@@ -315,7 +315,7 @@ impl<T: Trait> Module<T> {
 
         if Self::votes_are_enough(transfer.votes) {
             match message.status {
-                Status::Confirmed => (), // if burn is confirmed
+                Status::Confirmed | Status::Canceled => (), // if burn is confirmed or canceled
                 _ => match transfer.kind {
                     Kind::Transfer => message.status = Status::Approved,
                     Kind::Limits => limit_message.status = Status::Approved,
@@ -326,13 +326,13 @@ impl<T: Trait> Module<T> {
             match transfer.kind {
                 Kind::Transfer => Self::execute_transfer(message)?,
                 Kind::Limits => Self::_update_limits(limit_message)?,
-                Kind::Validator => Self::manage_validator(validator_message)?,
+                Kind::Validator => Self::manage_bridge(validator_message)?,
                 Kind::Bridge => Self::manage_bridge(bridge_message)?,
             }
             transfer.open = false;
         } else {
             match message.status {
-                Status::Confirmed => (),
+                Status::Confirmed | Status::Canceled => (),
                 _ => Self::set_pending(transfer_id, transfer.kind.clone())?,
             };
         }
@@ -348,7 +348,6 @@ impl<T: Trait> Module<T> {
         if !<TransferId<T>>::exists(transfer_hash) {
             Self::create_transfer(transfer_hash, kind)?;
         }
-
         Ok(())
     }
 
@@ -379,6 +378,10 @@ impl<T: Trait> Module<T> {
             message.amount,
         ));
         Self::update_status(message.message_id, Status::Approved, Kind::Transfer)
+    }
+    fn _cancel_transfer(message: TransferMessage<T::AccountId, T::Hash>) -> Result {
+        <token::Module<T>>::unlock(&message.substrate_address, message.amount)?;
+        Self::update_status(message.message_id, Status::Canceled, Kind::Transfer)
     }
     fn pause_the_bridge(message: BridgeMessage<T::AccountId, T::Hash>) -> Result {
         <BridgeIsOperational<T>>::mutate(|x| *x = false);
@@ -429,7 +432,7 @@ impl<T: Trait> Module<T> {
     }
 
     /// add validator
-    fn _add_validator(info: ValidatorMessage<T::AccountId, T::Hash>) -> Result {
+    fn _add_validator(info: BridgeMessage<T::AccountId, T::Hash>) -> Result {
         ensure!(
             <ValidatorsCount<T>>::get() < MAX_VALIDATORS,
             "Validators maximum reached."
@@ -441,7 +444,7 @@ impl<T: Trait> Module<T> {
     }
 
     /// remove validator
-    fn _remove_validator(info: ValidatorMessage<T::AccountId, T::Hash>) -> Result {
+    fn _remove_validator(info: BridgeMessage<T::AccountId, T::Hash>) -> Result {
         ensure!(
             <ValidatorsCount<T>>::get() > 1,
             "Can not remove last validator."
@@ -454,7 +457,7 @@ impl<T: Trait> Module<T> {
 
     /// check votes validity
     fn votes_are_enough(votes: MemberId) -> bool {
-        votes as f64 / Self::validators_count() as f64 >= 0.51
+        votes as f64 / f64::from(Self::validators_count()) >= 0.51
     }
 
     /// lock funds after set_transfer call
@@ -485,18 +488,20 @@ impl<T: Trait> Module<T> {
         match message.action {
             Status::Deposit => match message.status {
                 Status::Approved => Self::deposit(message),
+                Status::Canceled => Self::_cancel_transfer(message),
                 _ => Err("Tried to deposit with non-supported status"),
             },
             Status::Withdraw => match message.status {
                 Status::Confirmed => Self::execute_burn(message.message_id),
                 Status::Approved => Self::withdraw(message),
+                Status::Canceled => Self::_cancel_transfer(message),
                 _ => Err("Tried to withdraw with non-supported status"),
             },
             _ => Err("Tried to execute transfer with non-supported status"),
         }
     }
 
-    fn manage_validator(message: ValidatorMessage<T::AccountId, T::Hash>) -> Result {
+    fn manage_bridge(message: BridgeMessage<T::AccountId, T::Hash>) -> Result {
         match message.action {
             Status::AddValidator => match message.status {
                 Status::Approved => Self::_add_validator(message),
@@ -506,12 +511,6 @@ impl<T: Trait> Module<T> {
                 Status::Approved => Self::_remove_validator(message),
                 _ => Err("Tried to remove validator with non-supported status"),
             },
-            _ => Err("Tried to manage validator with non-supported status"),
-        }
-    }
-
-    fn manage_bridge(message: BridgeMessage<T::AccountId, T::Hash>) -> Result {
-        match message.action {
             Status::PauseTheBridge => match message.status {
                 Status::Approved => Self::pause_the_bridge(message),
                 _ => Err("Tried to pause the bridge with non-supported status"),
@@ -550,6 +549,7 @@ impl<T: Trait> Module<T> {
 
         Ok(())
     }
+
     fn set_pending(transfer_id: ProposalId, kind: Kind) -> Result {
         let message_id = <MessageId<T>>::get(transfer_id);
         match kind {
@@ -597,7 +597,9 @@ impl<T: Trait> Module<T> {
         let message = <TransferMessages<T>>::get(message_id);
         let transfer_id = <TransferId<T>>::get(message_id);
         let mut transfer = <BridgeTransfers<T>>::get(transfer_id);
-        if !transfer.open && message.status == Status::Confirmed {
+        let is_eth_response =
+            message.status == Status::Confirmed || message.status == Status::Canceled;
+        if !transfer.open && is_eth_response {
             transfer.votes = 0;
             transfer.open = true;
             <BridgeTransfers<T>>::insert(transfer_id, transfer);
@@ -639,6 +641,7 @@ impl<T: Trait> Module<T> {
         ensure!(can_burn, "Too many pending burn transactions.");
         Ok(())
     }
+
     fn check_pending_mint(amount: TokenBalance) -> Result {
         let new_pending_volume = <CurrentPendingMint<T>>::get()
             .checked_add(amount)
@@ -1003,6 +1006,142 @@ mod tests {
             assert_noop!(
                 BridgeModule::confirm_transfer(Origin::signed(V1), sub_message_id),
                 "This transfer must be approved first."
+            );
+        })
+    }
+    #[test]
+    fn token_sub2eth_burn_cancel_works() {
+        with_externalities(&mut new_test_ext(), || {
+            let eth_message_id = H256::from(ETH_MESSAGE_ID);
+            let eth_address = H160::from(ETH_ADDRESS);
+            let amount1 = 99 * 10u128.pow(18);
+            let amount2 = 50 * 10u128.pow(18);
+
+            //substrate <----- ETH
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id,
+                eth_address,
+                USER2,
+                amount1
+            ));
+
+            //substrate ----> ETH
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER2),
+                eth_address,
+                amount2
+            ));
+
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(1);
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V2),
+                sub_message_id
+            ));
+            let mut message = BridgeModule::messages(sub_message_id);
+            // funds are locked and waiting for confirmation
+            assert_eq!(message.status, Status::Approved);
+            assert_ok!(BridgeModule::cancel_transfer(
+                Origin::signed(V2),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::cancel_transfer(
+                Origin::signed(V3),
+                sub_message_id
+            ));
+            message = BridgeModule::messages(sub_message_id);
+            assert_eq!(message.status, Status::Canceled);
+        })
+    }
+    #[test]
+    fn burn_cancel_should_fail() {
+        with_externalities(&mut new_test_ext(), || {
+            let eth_message_id = H256::from(ETH_MESSAGE_ID);
+            let eth_address = H160::from(ETH_ADDRESS);
+            let amount1 = 99 * 10u128.pow(18);
+            let amount2 = 50 * 10u128.pow(18);
+
+            //substrate <----- ETH
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id,
+                eth_address,
+                USER2,
+                amount1
+            ));
+
+            //substrate ----> ETH
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER2),
+                eth_address,
+                amount2
+            ));
+
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(1);
+            let get_message = || BridgeModule::messages(sub_message_id);
+
+            let mut message = get_message();
+            assert_eq!(message.status, Status::Withdraw);
+
+            //approval
+            assert_eq!(TokenModule::locked(USER2), 0);
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V2),
+                sub_message_id
+            ));
+
+            message = get_message();
+            assert_eq!(message.status, Status::Approved);
+
+            // at this point transfer is in Approved status and are waiting for confirmation
+            // from ethereum side to burn. Funds are locked.
+            assert_eq!(TokenModule::locked(USER2), amount2);
+            assert_eq!(TokenModule::balance_of(USER2), amount1);
+            // once it happends, validators call confirm_transfer
+
+            assert_ok!(BridgeModule::confirm_transfer(
+                Origin::signed(V2),
+                sub_message_id
+            ));
+
+            message = get_message();
+            let transfer = BridgeModule::transfers(1);
+            assert_eq!(message.status, Status::Confirmed);
+            assert_eq!(transfer.open, true);
+            assert_ok!(BridgeModule::confirm_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            // assert_ok!(BridgeModule::confirm_transfer(Origin::signed(USER1), sub_message_id));
+            //BurnedMessage(Hash, AccountId, H160, u64) event emitted
+            let tokens_left = amount1 - amount2;
+            assert_eq!(TokenModule::balance_of(USER2), tokens_left);
+            assert_eq!(TokenModule::total_supply(), tokens_left);
+            assert_noop!(
+                BridgeModule::cancel_transfer(Origin::signed(V2), sub_message_id),
+                "Failed to cancel. This transfer is already executed."
             );
         })
     }
