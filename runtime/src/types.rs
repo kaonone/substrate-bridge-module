@@ -48,7 +48,7 @@ pub enum Status {
     Confirmed,
 }
 
-#[derive(Encode, Decode, Clone)]
+#[derive(Encode, Decode, Clone, PartialEq)]
 #[cfg_attr(feature = "std", derive(Debug))]
 pub enum Kind {
     Transfer,
@@ -66,15 +66,6 @@ pub struct TransferMessage<AccountId, Hash> {
     pub amount: TokenBalance,
     pub status: Status,
     pub action: Status,
-}
-
-#[derive(Encode, Decode, Clone)]
-#[cfg_attr(feature = "std", derive(Debug))]
-pub struct ValidatorMessage<AccountId, Hash> {
-    pub message_id: Hash,
-    pub account: AccountId,
-    pub action: Status,
-    pub status: Status,
 }
 
 #[derive(Encode, Decode, Clone)]
@@ -112,21 +103,6 @@ where
     }
 }
 
-impl<A, H> Default for ValidatorMessage<A, H>
-where
-    A: Default,
-    H: Default,
-{
-    fn default() -> Self {
-        ValidatorMessage {
-            message_id: H::default(),
-            account: A::default(),
-            action: Status::Revoked,
-            status: Status::Revoked,
-        }
-    }
-}
-
 impl<H> Default for LimitMessage<H>
 where
     H: Default,
@@ -150,8 +126,8 @@ where
         BridgeMessage {
             message_id: H::default(),
             account: A::default(),
-            action: Status::PauseTheBridge,
-            status: Status::PauseTheBridge,
+            action: Status::Revoked,
+            status: Status::Revoked,
         }
     }
 }

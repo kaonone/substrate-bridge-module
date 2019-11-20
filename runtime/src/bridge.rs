@@ -5,11 +5,11 @@
 use crate::token;
 use crate::types::{
     BridgeMessage, BridgeTransfer, Kind, LimitMessage, MemberId, ProposalId, Status, TokenBalance,
-    TransferMessage, ValidatorMessage,
+    TransferMessage,
 };
-use rstd::prelude::Vec;
 use parity_codec::Encode;
 use primitives::H160;
+use rstd::prelude::Vec;
 use runtime_primitives::traits::{As, Hash};
 use support::{
     decl_event, decl_module, decl_storage, dispatch::Result, ensure, fail, StorageMap, StorageValue,
@@ -60,7 +60,7 @@ decl_storage! {
 
         ValidatorsCount get(validators_count) config(): u32 = 3;
         ValidatorVotes get(validator_votes): map(ProposalId, T::AccountId) => bool;
-        ValidatorHistory get(validator_history): map (T::Hash) => ValidatorMessage<T::AccountId, T::Hash>;
+        ValidatorHistory get(validator_history): map (T::Hash) => BridgeMessage<T::AccountId, T::Hash>;
         Validators get(validators) build(|config: &GenesisConfig<T>| {
             config.validator_accounts.clone().into_iter()
             .map(|acc: T::AccountId| (acc, true)).collect::<Vec<_>>()
@@ -231,7 +231,7 @@ decl_module! {
             let hash = ("add", &address).using_encoded(<T as system::Trait>::Hashing::hash);
 
             if !<ValidatorHistory<T>>::exists(hash) {
-                let message = ValidatorMessage {
+                let message = BridgeMessage {
                     message_id: hash,
                     account: address,
                     action: Status::AddValidator,
@@ -255,7 +255,7 @@ decl_module! {
             let hash = ("remove", &address).using_encoded(<T as system::Trait>::Hashing::hash);
 
             if !<ValidatorHistory<T>>::exists(hash) {
-                let message = ValidatorMessage {
+                let message = BridgeMessage {
                     message_id: hash,
                     account: address,
                     action: Status::RemoveValidator,
@@ -378,7 +378,7 @@ impl<T: Trait> Module<T> {
             match transfer.kind {
                 Kind::Transfer => Self::execute_transfer(message)?,
                 Kind::Limits => Self::manage_limits(limit_message)?,
-                Kind::Validator => Self::manage_validator(validator_message)?,
+                Kind::Validator => Self::manage_bridge(validator_message)?,
                 Kind::Bridge => Self::manage_bridge(bridge_message)?,
             }
             transfer.open = false;
@@ -466,7 +466,7 @@ impl<T: Trait> Module<T> {
     }
 
     /// add validator
-    fn _add_validator(info: ValidatorMessage<T::AccountId, T::Hash>) -> Result {
+    fn _add_validator(info: BridgeMessage<T::AccountId, T::Hash>) -> Result {
         ensure!(
             <ValidatorsCount<T>>::get() < MAX_VALIDATORS,
             "Validators maximum reached."
@@ -478,7 +478,7 @@ impl<T: Trait> Module<T> {
     }
 
     /// remove validator
-    fn _remove_validator(info: ValidatorMessage<T::AccountId, T::Hash>) -> Result {
+    fn _remove_validator(info: BridgeMessage<T::AccountId, T::Hash>) -> Result {
         ensure!(
             <ValidatorsCount<T>>::get() > 1,
             "Can not remove last validator."
@@ -533,7 +533,7 @@ impl<T: Trait> Module<T> {
         }
     }
 
-    fn manage_validator(message: ValidatorMessage<T::AccountId, T::Hash>) -> Result {
+    fn manage_bridge(message: BridgeMessage<T::AccountId, T::Hash>) -> Result {
         match message.action {
             Status::AddValidator => match message.status {
                 Status::Approved => Self::_add_validator(message),
@@ -543,12 +543,6 @@ impl<T: Trait> Module<T> {
                 Status::Approved => Self::_remove_validator(message),
                 _ => Err("Tried to remove validator with non-supported status"),
             },
-            _ => Err("Tried to manage validator with non-supported status"),
-        }
-    }
-
-    fn manage_bridge(message: BridgeMessage<T::AccountId, T::Hash>) -> Result {
-        match message.action {
             Status::PauseTheBridge => match message.status {
                 Status::Approved => Self::pause_the_bridge(message),
                 _ => Err("Tried to pause the bridge with non-supported status"),
@@ -565,11 +559,11 @@ impl<T: Trait> Module<T> {
         match message.action {
             Status::ChangeMinTx => match message.status {
                 Status::Approved => Self::_change_min_limit(message),
-                _ => Err("Tried to pause the bridge with non-supported status"),
+                _ => Err("Tried to change min transaction with non-supported status"),
             },
             Status::ChangeMaxTx => match message.status {
                 Status::Approved => Self::_change_max_limit(message),
-                _ => Err("Tried to resume the bridge with non-supported status"),
+                _ => Err("Tried to change max transaction with non-supported status"),
             },
             Status::ChangePendingBurnLimit => match message.status {
                 Status::Approved => Self::_change_pending_burn_limit(message),
@@ -609,18 +603,16 @@ impl<T: Trait> Module<T> {
 
         Ok(())
     }
+
     fn set_pending(transfer_id: ProposalId, kind: Kind) -> Result {
         let message_id = <MessageId<T>>::get(transfer_id);
-        match kind {
-            Kind::Transfer => {
-                let message = <TransferMessages<T>>::get(message_id);
-                match message.action {
-                    Status::Withdraw => <PendingBurnCount<T>>::mutate(|c| *c += 1),
-                    Status::Deposit => <PendingMintCount<T>>::mutate(|c| *c += 1),
-                    _ => (),
-                }
+        if kind == Kind::Transfer {
+            let message = <TransferMessages<T>>::get(message_id);
+            match message.action {
+                Status::Withdraw => <PendingBurnCount<T>>::mutate(|c| *c += 1),
+                Status::Deposit => <PendingMintCount<T>>::mutate(|c| *c += 1),
+                _ => (),
             }
-            _ => (),
         }
         Self::update_status(message_id, Status::Pending, kind)
     }
