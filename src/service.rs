@@ -4,7 +4,7 @@
 
 use basic_authorship::ProposerFactory;
 use consensus::{import_queue, start_aura, AuraImportQueue, NothingExtra, SlotDuration};
-use erc20_substrate_bridge_runtime::{self, opaque::Block, GenesisConfig, RuntimeApi};
+use polkadai_bridge_runtime::{self, opaque::Block, GenesisConfig, RuntimeApi};
 use grandpa;
 use inherents::InherentDataProviders;
 use log::info;
@@ -25,9 +25,9 @@ pub use substrate_executor::NativeExecutor;
 // Our native executor instance.
 native_executor_instance!(
 	pub Executor,
-	erc20_substrate_bridge_runtime::api::dispatch,
-	erc20_substrate_bridge_runtime::native_version,
-	include_bytes!("../runtime/wasm/target/wasm32-unknown-unknown/release/erc20_substrate_bridge_runtime_wasm.compact.wasm")
+	polkadai_bridge_runtime::api::dispatch,
+	polkadai_bridge_runtime::native_version,
+	include_bytes!("../runtime/wasm/target/wasm32-unknown-unknown/release/polkadai_bridge_runtime_wasm.compact.wasm")
 );
 
 pub struct NodeConfig<F: substrate_service::ServiceFactory> {

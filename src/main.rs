@@ -17,9 +17,9 @@ fn run() -> cli::error::Result<()> {
         name: "Substrate Node",
         commit: env!("VERGEN_SHA_SHORT"),
         version: env!("CARGO_PKG_VERSION"),
-        executable_name: "erc20-substrate-bridge",
+        executable_name: "polkadai-bridge",
         author: "Akropolis",
-        description: "erc20-substrate-bridge",
+        description: "polkadai-bridge",
         support_url: "support@akropolis.io",
     };
     cli::run(::std::env::args(), cli::Exit, version)

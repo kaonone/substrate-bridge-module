@@ -17,6 +17,16 @@ pub struct Token {
     pub symbol: Vec<u8>,
 }
 
+#[derive(Encode, Decode, Default, Clone, PartialEq)]
+#[cfg_attr(feature = "std", derive(Debug))]
+pub struct Limits {
+    pub max_tx_value: u128,
+    pub day_max_limit: u128,
+    pub day_max_limit_for_one_address: u128,
+    pub max_pending_tx_limit: u128,
+    pub min_tx_value: u128,
+}
+
 // bridge types
 #[derive(Encode, Decode, Clone)]
 #[cfg_attr(feature = "std", derive(Debug))]
@@ -37,10 +47,7 @@ pub enum Status {
     ResumeTheBridge,
     AddValidator,
     RemoveValidator,
-    ChangeMinTx,
-    ChangeMaxTx,
-    ChangePendingBurnLimit,
-    ChangePendingMintLimit,
+    UpdateLimits,
     Deposit,
     Withdraw,
     Approved,
@@ -71,9 +78,8 @@ pub struct TransferMessage<AccountId, Hash> {
 #[derive(Encode, Decode, Clone)]
 #[cfg_attr(feature = "std", derive(Debug))]
 pub struct LimitMessage<Hash> {
-    pub message_id: Hash,
-    pub amount: TokenBalance,
-    pub action: Status,
+    pub id: Hash,
+    pub limits: Limits,
     pub status: Status,
 }
 
@@ -109,10 +115,9 @@ where
 {
     fn default() -> Self {
         LimitMessage {
-            message_id: H::default(),
-            amount: TokenBalance::default(),
-            status: Status::ChangeMinTx,
-            action: Status::ChangeMinTx,
+            id: H::default(),
+            limits: Limits::default(),
+            status: Status::UpdateLimits,
         }
     }
 }
@@ -144,5 +149,17 @@ where
             votes: MemberId::default(),
             kind: Kind::Transfer,
         }
+    }
+}
+
+impl Limits {
+    pub fn into_array(&self) -> [u128; 5] {
+        [
+            self.max_tx_value,
+            self.day_max_limit,
+            self.day_max_limit_for_one_address,
+            self.max_pending_tx_limit,
+            self.min_tx_value,
+        ]
     }
 }

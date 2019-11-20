@@ -3,7 +3,7 @@ crate-type = ['cdylib']
 
 [features]
 default = []
-std = ['erc20-substrate-bridge-runtime/std']
+std = ['polkadai-bridge-runtime/std']
 
 [workspace]
 members = []
@@ -14,8 +14,8 @@ panic = 'abort'
 [package]
 authors = ['Akropolis <admin@akropolis.io>']
 edition = '2018'
-name = 'erc20-substrate-bridge-runtime-wasm'
+name = 'polkadai-bridge-runtime-wasm'
 version = '1.0.0'
-[dependencies.erc20-substrate-bridge-runtime]
+[dependencies.polkadai-bridge-runtime]
 default-features = false
 path = '..'

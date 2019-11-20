@@ -89,8 +89,8 @@ pub mod opaque {
 
 /// This runtime version.
 pub const VERSION: RuntimeVersion = RuntimeVersion {
-    spec_name: create_runtime_str!("erc20-substrate-bridge"),
-    impl_name: create_runtime_str!("erc20-substrate-bridge"),
+    spec_name: create_runtime_str!("polkadai-bridge"),
+    impl_name: create_runtime_str!("polkadai-bridge"),
     authoring_version: 3,
     spec_version: 4,
     impl_version: 4,

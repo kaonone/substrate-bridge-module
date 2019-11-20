@@ -2,8 +2,8 @@
 authors = ['Akropolis <admin@akropolis.io>']
 build = 'build.rs'
 edition = '2018'
-name = 'erc20-substrate-bridge'
-version = '0.0.2'
+name = 'polkadai-bridge'
+version = '0.0.3'
 
 [dependencies]
 error-chain = '0.12'
@@ -19,17 +19,17 @@ trie-root = '0.12.0'
 [dependencies.basic-authorship]
 git = 'https://github.com/paritytech/substrate.git'
 package = 'substrate-basic-authorship'
-rev = 'fc206f3a009b64fc746202e5b4c701bf7e24d1f1'
+rev = 'cc1d67e973fd02c0c997b164ba516cf041bf21f1'
 
 [dependencies.consensus]
 git = 'https://github.com/paritytech/substrate.git'
 package = 'substrate-consensus-aura'
-rev = 'fc206f3a009b64fc746202e5b4c701bf7e24d1f1'
+rev = 'cc1d67e973fd02c0c997b164ba516cf041bf21f1'
 
 [dependencies.grandpa]
 git = "https://github.com/paritytech/substrate.git"
 package = "substrate-finality-grandpa"
-rev = 'fc206f3a009b64fc746202e5b4c701bf7e24d1f1'
+rev = 'cc1d67e973fd02c0c997b164ba516cf041bf21f1'
 
 [dependencies.ctrlc]
 features = ['termination']
@@ -38,50 +38,50 @@ version = '3.0'
 [dependencies.inherents]
 git = 'https://github.com/paritytech/substrate.git'
 package = 'substrate-inherents'
-rev = 'fc206f3a009b64fc746202e5b4c701bf7e24d1f1'
+rev = 'cc1d67e973fd02c0c997b164ba516cf041bf21f1'
 
 [dependencies.network]
 git = 'https://github.com/paritytech/substrate.git'
 package = 'substrate-network'
-rev = 'fc206f3a009b64fc746202e5b4c701bf7e24d1f1'
+rev = 'cc1d67e973fd02c0c997b164ba516cf041bf21f1'
 
-[dependencies.erc20-substrate-bridge-runtime]
+[dependencies.polkadai-bridge-runtime]
 path = 'runtime'
 
 [dependencies.primitives]
 git = 'https://github.com/paritytech/substrate.git'
 package = 'substrate-primitives'
-rev = 'fc206f3a009b64fc746202e5b4c701bf7e24d1f1'
+rev = 'cc1d67e973fd02c0c997b164ba516cf041bf21f1'
 
 [dependencies.sr-io]
 git = 'https://github.com/paritytech/substrate.git'
-rev = 'fc206f3a009b64fc746202e5b4c701bf7e24d1f1'
+rev = 'cc1d67e973fd02c0c997b164ba516cf041bf21f1'
 
 [dependencies.substrate-cli]
 git = 'https://github.com/paritytech/substrate.git'
-rev = 'fc206f3a009b64fc746202e5b4c701bf7e24d1f1'
+rev = 'cc1d67e973fd02c0c997b164ba516cf041bf21f1'
 
 [dependencies.substrate-client]
 git = 'https://github.com/paritytech/substrate.git'
-rev = 'fc206f3a009b64fc746202e5b4c701bf7e24d1f1'
+rev = 'cc1d67e973fd02c0c997b164ba516cf041bf21f1'
 
 [dependencies.substrate-executor]
 git = 'https://github.com/paritytech/substrate.git'
-rev = 'fc206f3a009b64fc746202e5b4c701bf7e24d1f1'
+rev = 'cc1d67e973fd02c0c997b164ba516cf041bf21f1'
 
 [dependencies.substrate-service]
 git = 'https://github.com/paritytech/substrate.git'
-rev = 'fc206f3a009b64fc746202e5b4c701bf7e24d1f1'
+rev = 'cc1d67e973fd02c0c997b164ba516cf041bf21f1'
 
 [dependencies.transaction-pool]
 git = 'https://github.com/paritytech/substrate.git'
 package = 'substrate-transaction-pool'
-rev = 'fc206f3a009b64fc746202e5b4c701bf7e24d1f1'
+rev = 'cc1d67e973fd02c0c997b164ba516cf041bf21f1'
 
 [dependencies.telemetry]
 git = 'https://github.com/paritytech/substrate.git'
 package = 'substrate-telemetry'
-rev = 'fc206f3a009b64fc746202e5b4c701bf7e24d1f1'
+rev = 'cc1d67e973fd02c0c997b164ba516cf041bf21f1'
 
 [build-dependencies]
 vergen = '3'
@@ -89,5 +89,5 @@ vergen = '3'
 panic = 'unwind'
 
 [[bin]]
-name = 'erc20-substrate-bridge'
+name = 'polkadai-bridge'
 path = 'src/main.rs'
