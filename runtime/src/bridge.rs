@@ -17,7 +17,8 @@ use support::{
 use system::{self, ensure_signed};
 
 const MAX_VALIDATORS: u32 = 100_000;
-const DAY: u64 = 14_400;
+const DAY_IN_BLOCKS: u64 = 14_400;
+const DAY: u64 = 86_400;
 
 decl_event!(
     pub enum Event<T>
@@ -63,6 +64,8 @@ decl_storage! {
         MessageId get(message_id_by_transfer_id): map(ProposalId) => T::Hash;
 
         DailyHolds get(daily_holds): map(T::AccountId) => (T::BlockNumber, T::Hash);
+        DailyLimits get(daily_limits_by_account): map(T::AccountId) => TokenBalance;
+        DailyBlocked get(daily_blocked): map(T::Moment) => Vec<T::AccountId>;
 
         ValidatorsCount get(validators_count) config(): u32 = 3;
         ValidatorVotes get(validator_votes): map(ProposalId, T::AccountId) => bool;
@@ -87,15 +90,16 @@ decl_module! {
             ensure!(Self::bridge_is_operational(), "Bridge is not operational");
 
 
-            Self::check_pending_burn(amount)?;
             Self::check_amount(amount)?;
+            Self::check_pending_burn(amount)?;
+            Self::check_daily_account_volume(from.clone(), amount)?;
 
             let transfer_hash = (&from, &to, amount, <timestamp::Module<T>>::get()).using_encoded(<T as system::Trait>::Hashing::hash);
 
             let message = TransferMessage {
                 message_id: transfer_hash,
                 eth_address: to,
-                substrate_address: from,
+                substrate_address: from.clone(),
                 amount,
                 status: Status::Withdraw,
                 action: Status::Withdraw,
@@ -103,6 +107,7 @@ decl_module! {
             Self::get_transfer_id_checked(transfer_hash, Kind::Transfer)?;
             Self::deposit_event(RawEvent::RelayMessage(transfer_hash));
 
+            <DailyLimits<T>>::mutate(from, |a| *a += amount);
             <TransferMessages<T>>::insert(transfer_hash, message);
             Ok(())
         }
@@ -297,6 +302,15 @@ decl_module! {
 
             Ok(())
         }
+
+        //close enough to clear it exactly at UTC 00:00 instead of BlockNumber
+        fn on_finalize() {
+            // clear accounts blocked day earlier (e.g. 18759 - 1)
+            let yesterday = <timestamp::Module<T>>::get() - T::Moment::sa(1);
+            if <DailyBlocked<T>>::exists(&yesterday) {
+                <DailyBlocked<T>>::remove(&yesterday)
+    }
+}
     }
 }
 
@@ -474,6 +488,7 @@ impl<T: Trait> Module<T> {
 
         <token::Module<T>>::unlock(&from, message.amount)?;
         <token::Module<T>>::_burn(from.clone(), message.amount)?;
+        <DailyLimits<T>>::mutate(from.clone(), |a| *a -= message.amount);
 
         Self::deposit_event(RawEvent::BurnedMessage(
             message_id,
@@ -617,6 +632,26 @@ impl<T: Trait> Module<T> {
         Ok(())
     }
 
+    fn check_daily_account_volume(account: T::AccountId, amount: TokenBalance) -> Result {
+        let cur_pending = <DailyLimits<T>>::get(&account);
+        let cur_pending_account_limit = <CurrentLimits<T>>::get().day_max_limit_for_one_address;
+        let can_burn = cur_pending + amount < cur_pending_account_limit;
+        //store current day (like 18768)
+        let cur_day = <timestamp::Module<T>>::get() / T::Moment::sa(DAY);
+        let user_blocked = <DailyBlocked<T>>::get(&cur_day)
+            .iter()
+            .any(|a| *a == account);
+
+        if !can_burn {
+            <DailyBlocked<T>>::mutate(cur_day, |v| v.push(account));
+        }
+        ensure!(
+            can_burn || user_blocked,
+            "Transfer declined, user blocked due to daily volume limit."
+        );
+
+        Ok(())
+    }
     fn check_amount(amount: TokenBalance) -> Result {
         let max = <CurrentLimits<T>>::get().max_tx_value;
         let min = <CurrentLimits<T>>::get().min_tx_value;
@@ -629,7 +664,6 @@ impl<T: Trait> Module<T> {
             amount < max,
             "Invalid amount for transaction. Reached maximum limit."
         );
-
         Ok(())
     }
     //open transactions check
@@ -671,7 +705,7 @@ impl<T: Trait> Module<T> {
     fn check_daily_holds(message: TransferMessage<T::AccountId, T::Hash>) -> Result {
         let from = message.substrate_address;
         let first_tx = <DailyHolds<T>>::get(from.clone());
-        let daily_hold = T::BlockNumber::sa(DAY);
+        let daily_hold = T::BlockNumber::sa(DAY_IN_BLOCKS);
         let day_passed = first_tx.0 + daily_hold < T::BlockNumber::sa(0);
 
         if !day_passed {
@@ -697,7 +731,7 @@ impl<T: Trait> Module<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    //TODO: fix limits after adding them into config
     use primitives::{Blake2Hasher, H160, H256};
     use runtime_io::with_externalities;
     use runtime_primitives::{
@@ -1587,6 +1621,112 @@ mod tests {
                     amount1 + 5
                 ),
                 "Too many pending mint transactions."
+            );
+        })
+    }
+    #[test]
+    fn blocking_account_by_volume_should_work() {
+        with_externalities(&mut new_test_ext(), || {
+            let eth_message_id = H256::from(ETH_MESSAGE_ID);
+            let eth_message_id2 = H256::from(ETH_MESSAGE_ID2);
+            let eth_message_id3 = H256::from(ETH_MESSAGE_ID3);
+            let eth_message_id4 = H256::from(ETH_MESSAGE_ID4);
+            let eth_message_id5 = H256::from(ETH_MESSAGE_ID5);
+            let eth_message_id6 = H256::from(ETH_MESSAGE_ID6);
+            let eth_address = H160::from(ETH_ADDRESS);
+            let amount1 = 99 * 10u128.pow(18);
+            let amount2 = 401 * 10u128.pow(18);
+            
+            //TODO: move limits to chain_spec
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            //& delete this afterwards
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id2,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id2,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id3,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id3,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id4,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id4,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id5,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id5,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id6,
+                eth_address,
+                USER2,
+                amount1
+            ));
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V1),
+                eth_message_id6,
+                eth_address,
+                USER2,
+                amount1
+            ));
+
+            assert_noop!(
+                BridgeModule::set_transfer(Origin::signed(USER2), eth_address, amount2),
+                "Transfer declined, user blocked due to daily volume limit."
             );
         })
     }
