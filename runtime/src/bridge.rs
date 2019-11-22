@@ -316,11 +316,14 @@ decl_module! {
         //close enough to clear it exactly at UTC 00:00 instead of BlockNumber
         fn on_finalize() {
             // clear accounts blocked day earlier (e.g. 18759 - 1)
-            let yesterday = <timestamp::Module<T>>::get()/T::Moment::sa(DAY) - T::Moment::sa(1);
-            println!("finalize {:?}", yesterday);
-            if <DailyBlocked<T>>::exists(&yesterday) {
-                <DailyBlocked<T>>::remove(&yesterday)
+            let yesterday = Self::get_day_pair().0;
+            let is_first_day = Self::get_day_pair().1 == yesterday;
+            if <DailyBlocked<T>>::exists(&yesterday) && !is_first_day {
+                let blocked_yesterday = <DailyBlocked<T>>::get(&yesterday);
+                blocked_yesterday.iter().for_each(|a| <DailyLimits<T>>::remove(a));
+                <DailyBlocked<T>>::remove(&yesterday);
             }
+            
         }
     }
 }
@@ -368,6 +371,15 @@ impl<T: Trait> Module<T> {
         Ok(())
     }
 
+    ///get (yesterday,today) pair
+    fn get_day_pair() -> (T::Moment, T::Moment) {
+        let now = <timestamp::Module<T>>::get();
+        let day = T::Moment::sa(DAY);
+        let today = <timestamp::Module<T>>::get() / T::Moment::sa(DAY);
+        let yesterday = if now < day {T::Moment::sa(0)} else {<timestamp::Module<T>>::get()/day - T::Moment::sa(1)};
+        (yesterday, today)
+    }
+
     ///ensure that such transfer exist
     fn get_transfer_id_checked(transfer_hash: T::Hash, kind: Kind) -> Result {
         if !<TransferId<T>>::exists(transfer_hash) {
@@ -376,6 +388,7 @@ impl<T: Trait> Module<T> {
         Ok(())
     }
 
+    ///execute actual mint
     fn deposit(message: TransferMessage<T::AccountId, T::Hash>) -> Result {
         Self::sub_pending_mint(message.clone())?;
         let to = message.substrate_address;
@@ -647,21 +660,22 @@ impl<T: Trait> Module<T> {
         let cur_pending = <DailyLimits<T>>::get(&account);
         let cur_pending_account_limit = <CurrentLimits<T>>::get().day_max_limit_for_one_address;
         let can_burn = cur_pending + amount < cur_pending_account_limit;
+
         //store current day (like 18768)
-        let cur_day = <timestamp::Module<T>>::get() / T::Moment::sa(DAY);
-        let user_blocked = <DailyBlocked<T>>::get(&cur_day)
+        let today = Self::get_day_pair().1;
+        let user_blocked = <DailyBlocked<T>>::get(&today)
             .iter()
             .any(|a| *a == account);
-        println!("day {:?} user_blocked {:?}", cur_day, user_blocked);
+
         if !can_burn {
-            <DailyBlocked<T>>::mutate(cur_day, |v| {
+            <DailyBlocked<T>>::mutate(today, |v| {
                 if !v.contains(&account) {
                     v.push(account)
                 }
             });
         }
         ensure!(
-            can_burn || user_blocked,
+            can_burn && !user_blocked,
             "Transfer declined, user blocked due to daily volume limit."
         );
 
@@ -751,7 +765,7 @@ mod tests {
     use runtime_io::with_externalities;
     use runtime_primitives::{
         testing::{Digest, DigestItem, Header},
-        traits::{BlakeTwo256, IdentityLookup},
+        traits::{BlakeTwo256, IdentityLookup, OnFinalize},
         BuildStorage,
     };
     use support::{assert_noop, assert_ok, impl_outer_origin};
@@ -827,6 +841,15 @@ mod tests {
     const USER8: u64 = 12;
     const USER9: u64 = 13;
 
+    //fast forward approximately
+    fn run_to_block(n: u64) {
+        while System::block_number() < n {
+            BridgeModule::on_finalize(System::block_number());
+            TimestampModule::set_timestamp(6 * n);
+            System::set_block_number(System::block_number() + 1);
+        }
+    }
+
     // This function basically just builds a genesis storage key/value store according to
     // our desired mockup.
     fn new_test_ext() -> runtime_io::TestExternalities<Blake2Hasher> {
@@ -835,6 +858,7 @@ mod tests {
             .unwrap()
             .0;
 
+        //specify balances chain_spec configuration
         r.extend(
             balances::GenesisConfig::<Test> {
                 balances: vec![
@@ -843,7 +867,7 @@ mod tests {
                     (V3, 100000),
                     (USER1, 100000),
                     (USER2, 300000),
-                ],
+                    ],
                 vesting: vec![],
                 transaction_base_fee: 0,
                 transaction_byte_fee: 0,
@@ -855,7 +879,8 @@ mod tests {
             .unwrap()
             .0,
         );
-
+        
+        //specify bridge chain_spec configuration
         r.extend(
             GenesisConfig::<Test> {
                 validators_count: 3u32,
@@ -1609,8 +1634,7 @@ mod tests {
             let eth_address = H160::from(ETH_ADDRESS);
             let amount1 = 600;
             let amount2 = 49;
-            TimestampModule::set_timestamp(DAY * 2);
-            System::set_block_number(DAY_IN_BLOCKS * 4);
+            run_to_block(DAY_IN_BLOCKS);
 
             let _ = TokenModule::_mint(USER2, amount1);
             assert_ok!(BridgeModule::set_transfer(
@@ -1631,15 +1655,13 @@ mod tests {
                 BridgeModule::set_transfer(Origin::signed(USER2), eth_address, amount2),
                 Err("Transfer declined, user blocked due to daily volume limit.")
             );
+
             //user added to blocked vec
-            System::finalize();
             let blocked_vec: Vec<u64> = vec![USER2];
-            assert_eq!(BridgeModule::daily_blocked(2), blocked_vec);
-            TimestampModule::set_timestamp(DAY * 3);
-            System::set_block_number(DAY_IN_BLOCKS * 3);
-            System::finalize();
-            let vec: Vec<u64> = vec![];
-            assert_eq!(BridgeModule::daily_blocked(3), vec);
+            assert_eq!(BridgeModule::daily_blocked(1), blocked_vec);
+
+            run_to_block(DAY_IN_BLOCKS * 2);
+            run_to_block(DAY_IN_BLOCKS * 3);
 
             //try again
             assert_ok!(BridgeModule::set_transfer(
