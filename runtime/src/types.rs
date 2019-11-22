@@ -45,8 +45,6 @@ pub enum Status {
     Pending,
     PauseTheBridge,
     ResumeTheBridge,
-    AddValidator,
-    RemoveValidator,
     UpdateValidatorSet,
     UpdateLimits,
     Deposit,
@@ -62,7 +60,6 @@ pub enum Kind {
     Transfer,
     Limits,
     Validator,
-    ValidatorBatchUpdate,
     Bridge,
 }
 
