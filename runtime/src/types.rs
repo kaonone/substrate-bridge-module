@@ -47,6 +47,7 @@ pub enum Status {
     ResumeTheBridge,
     AddValidator,
     RemoveValidator,
+    UpdateValidatorSet,
     UpdateLimits,
     Deposit,
     Withdraw,
@@ -61,6 +62,7 @@ pub enum Kind {
     Transfer,
     Limits,
     Validator,
+    ValidatorBatchUpdate,
     Bridge,
 }
 
@@ -88,6 +90,16 @@ pub struct LimitMessage<Hash> {
 pub struct BridgeMessage<AccountId, Hash> {
     pub message_id: Hash,
     pub account: AccountId,
+    pub action: Status,
+    pub status: Status,
+}
+
+#[derive(Encode, Decode, Clone)]
+#[cfg_attr(feature = "std", derive(Debug))]
+pub struct ValidatorsMessage<AccountId, Hash> {
+    pub message_id: Hash,
+    pub quorum: u64,
+    pub accounts: Vec<AccountId>,
     pub action: Status,
     pub status: Status,
 }
@@ -131,6 +143,22 @@ where
         BridgeMessage {
             message_id: H::default(),
             account: A::default(),
+            action: Status::Revoked,
+            status: Status::Revoked,
+        }
+    }
+}
+
+impl<A, H> Default for ValidatorsMessage<A, H>
+where
+    A: Default,
+    H: Default,
+{
+    fn default() -> Self {
+        ValidatorsMessage {
+            message_id: H::default(),
+            quorum: u64::default(),
+            accounts: Vec::default(),
             action: Status::Revoked,
             status: Status::Revoked,
         }

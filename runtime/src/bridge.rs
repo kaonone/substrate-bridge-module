@@ -5,7 +5,7 @@
 use crate::token;
 use crate::types::{
     BridgeMessage, BridgeTransfer, Kind, LimitMessage, Limits, MemberId, ProposalId, Status,
-    TokenBalance, TransferMessage,
+    TokenBalance, TransferMessage, ValidatorsMessage,
 };
 use parity_codec::Encode;
 use primitives::H160;
@@ -64,9 +64,11 @@ decl_storage! {
 
         DailyHolds get(daily_holds): map(T::AccountId) => (T::BlockNumber, T::Hash);
 
+        Quorum get(quorum): u64 = 2;
         ValidatorsCount get(validators_count) config(): u32 = 3;
         ValidatorVotes get(validator_votes): map(ProposalId, T::AccountId) => bool;
         ValidatorHistory get(validator_history): map (T::Hash) => BridgeMessage<T::AccountId, T::Hash>;
+        ValidatorBatchHistory get(validator_batch_history): map (T::Hash) => ValidatorsMessage<T::AccountId, T::Hash>;
         Validators get(validators) build(|config: &GenesisConfig<T>| {
             config.validator_accounts.clone().into_iter()
             .map(|acc: T::AccountId| (acc, true)).collect::<Vec<_>>()
@@ -217,6 +219,26 @@ decl_module! {
             let id = <TransferId<T>>::get(hash);
             Self::_sign(validator, id)
         }
+        // each validator calls it to update whole set of validators
+        fn update_validator_list(origin, message_id: T::Hash, quorum: u64, new_validator_list: Vec<T::AccountId>) -> Result {
+            let validator = ensure_signed(origin)?;
+            Self::check_validator(validator.clone())?;
+
+            if !<ValidatorHistory<T>>::exists(message_id) {
+                let message = ValidatorsMessage {
+                    message_id,
+                    quorum,
+                    accounts: new_validator_list,
+                    action: Status::UpdateValidatorSet,
+                    status: Status::UpdateValidatorSet,
+                };
+                <ValidatorBatchHistory<T>>::insert(message_id, message);
+                Self::get_transfer_id_checked(message_id, Kind::ValidatorBatchUpdate)?;
+            }
+
+            let id = <TransferId<T>>::get(message_id);
+            Self::_sign(validator, id)
+        }
 
         // each validator calls it to pause the bridge
         fn pause_bridge(origin) -> Result {
@@ -307,6 +329,7 @@ impl<T: Trait> Module<T> {
         let mut message = <TransferMessages<T>>::get(transfer.message_id);
         let mut limit_message = <LimitMessages<T>>::get(transfer.message_id);
         let mut validator_message = <ValidatorHistory<T>>::get(transfer.message_id);
+        let mut batch_message = <ValidatorBatchHistory<T>>::get(transfer.message_id);
         let mut bridge_message = <BridgeMessages<T>>::get(transfer.message_id);
         let voted = <ValidatorVotes<T>>::get((transfer_id, validator.clone()));
         ensure!(!voted, "This validator has already voted.");
@@ -320,6 +343,7 @@ impl<T: Trait> Module<T> {
                     Kind::Transfer => message.status = Status::Approved,
                     Kind::Limits => limit_message.status = Status::Approved,
                     Kind::Validator => validator_message.status = Status::Approved,
+                    Kind::ValidatorBatchUpdate => batch_message.status = Status::Approved,
                     Kind::Bridge => bridge_message.status = Status::Approved,
                 },
             }
@@ -327,6 +351,7 @@ impl<T: Trait> Module<T> {
                 Kind::Transfer => Self::execute_transfer(message)?,
                 Kind::Limits => Self::_update_limits(limit_message)?,
                 Kind::Validator => Self::manage_bridge(validator_message)?,
+                Kind::ValidatorBatchUpdate => Self::manage_validator_list(batch_message)?,
                 Kind::Bridge => Self::manage_bridge(bridge_message)?,
             }
             transfer.open = false;
@@ -455,6 +480,18 @@ impl<T: Trait> Module<T> {
         Ok(())
     }
 
+    /// update validators list
+    fn manage_validator_list(info: ValidatorsMessage<T::AccountId, T::Hash>) -> Result {
+        let new_count = u32::sa(info.accounts.clone().len());
+        <Quorum<T>>::put(info.quorum);
+        <ValidatorsCount<T>>::put(new_count);
+        info.accounts
+            .clone()
+            .iter()
+            .for_each(|v| <Validators<T>>::insert(v, true));
+        Self::update_status(info.message_id, Status::Confirmed, Kind::ValidatorBatchUpdate)
+    }
+
     /// check votes validity
     fn votes_are_enough(votes: MemberId) -> bool {
         votes as f64 / f64::from(Self::validators_count()) >= 0.51
@@ -577,6 +614,11 @@ impl<T: Trait> Module<T> {
                 let mut message = <ValidatorHistory<T>>::get(id);
                 message.status = status;
                 <ValidatorHistory<T>>::insert(id, message);
+            }
+            Kind::ValidatorBatchUpdate => {
+                let mut message = <ValidatorBatchHistory<T>>::get(id);
+                message.status = status;
+                <ValidatorBatchHistory<T>>::insert(id, message);
             }
             Kind::Bridge => {
                 let mut message = <BridgeMessages<T>>::get(id);
@@ -1171,6 +1213,33 @@ mod tests {
             message = BridgeModule::validator_history(id);
             assert_eq!(message.status, Status::Revoked);
             assert_eq!(BridgeModule::validators_count(), 2);
+        })
+    }
+    #[test]
+    fn update_validator_list_should_work() {
+        with_externalities(&mut new_test_ext(), || {
+            let eth_message_id = H256::from(ETH_MESSAGE_ID);
+            const QUORUM: u64 = 3;
+
+            assert_ok!(BridgeModule::update_validator_list(
+                Origin::signed(V2),
+                eth_message_id,
+                QUORUM,
+                vec![V1, V2, V3, V4]
+            ));
+            let id = BridgeModule::message_id_by_transfer_id(0);
+            let mut message = BridgeModule::validator_batch_history(id);
+            assert_eq!(message.status, Status::Pending);
+
+            assert_ok!(BridgeModule::update_validator_list(
+                Origin::signed(V1),
+                eth_message_id,
+                QUORUM,
+                vec![V1, V2, V3, V4]
+            ));
+            message = BridgeModule::validator_batch_history(id);
+            assert_eq!(message.status, Status::Confirmed);
+            assert_eq!(BridgeModule::validators_count(), 4);
         })
     }
     #[test]
