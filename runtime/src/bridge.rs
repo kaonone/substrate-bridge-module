@@ -2,6 +2,10 @@
 /// You can use mint to create tokens backed by locked funds on Ethereum side
 /// and transfer tokens on substrate side freely
 ///
+/// BUGS:
+///     1. Tests can fail with assert_noop! bug: fails through different root hashes
+///        solution: use assert_eq!(expr, Err("Error string")) explicitly
+///
 use crate::token;
 use crate::types::{
     BridgeMessage, BridgeTransfer, Kind, LimitMessage, Limits, MemberId, ProposalId, Status,
@@ -17,7 +21,8 @@ use support::{
 use system::{self, ensure_signed};
 
 const MAX_VALIDATORS: u32 = 100_000;
-const DAY: u64 = 14_400;
+const DAY_IN_BLOCKS: u64 = 14_400;
+const DAY: u64 = 86_400;
 
 decl_event!(
     pub enum Event<T>
@@ -44,13 +49,16 @@ decl_storage! {
 
         // limits change history
         LimitMessages get(limit_messages): map(T::Hash) => LimitMessage<T::Hash>;
-        CurrentLimits get(current_limits): Limits = Limits {
-            max_tx_value: 100*10u128.pow(18),
-            day_max_limit: 200*10u128.pow(18),
-            day_max_limit_for_one_address: 50*10u128.pow(18),
-            max_pending_tx_limit: 400*10u128.pow(18),
-            min_tx_value: 10*10u128.pow(18),
-        };
+        CurrentLimits get(current_limits) build(|config: &GenesisConfig<T>| {
+            let mut limits_iter = config.current_limits.clone().into_iter();
+            Limits {
+                max_tx_value: limits_iter.next().unwrap(),
+                day_max_limit: limits_iter.next().unwrap(),
+                day_max_limit_for_one_address: limits_iter.next().unwrap(),
+                max_pending_tx_limit: limits_iter.next().unwrap(),
+                min_tx_value: limits_iter.next().unwrap(),
+            }
+        }): Limits;
 
         // open transactions
         CurrentPendingBurn get(pending_burn_count): u128;
@@ -63,6 +71,8 @@ decl_storage! {
         MessageId get(message_id_by_transfer_id): map(ProposalId) => T::Hash;
 
         DailyHolds get(daily_holds): map(T::AccountId) => (T::BlockNumber, T::Hash);
+        DailyLimits get(daily_limits_by_account): map(T::AccountId) => TokenBalance;
+        DailyBlocked get(daily_blocked): map(T::Moment) => Vec<T::AccountId>;
 
         ValidatorsCount get(validators_count) config(): u32 = 3;
         ValidatorVotes get(validator_votes): map(ProposalId, T::AccountId) => bool;
@@ -73,6 +83,9 @@ decl_storage! {
         }): map (T::AccountId) => bool;
         ValidatorAccounts get(validator_accounts) config(): Vec<T::AccountId>;
     }
+    add_extra_genesis{
+        config(current_limits): Vec<u128>;
+}
 }
 
 decl_module! {
@@ -87,15 +100,16 @@ decl_module! {
             ensure!(Self::bridge_is_operational(), "Bridge is not operational");
 
 
-            Self::check_pending_burn(amount)?;
             Self::check_amount(amount)?;
+            Self::check_pending_burn(amount)?;
+            Self::check_daily_account_volume(from.clone(), amount)?;
 
             let transfer_hash = (&from, &to, amount, <timestamp::Module<T>>::get()).using_encoded(<T as system::Trait>::Hashing::hash);
 
             let message = TransferMessage {
                 message_id: transfer_hash,
                 eth_address: to,
-                substrate_address: from,
+                substrate_address: from.clone(),
                 amount,
                 status: Status::Withdraw,
                 action: Status::Withdraw,
@@ -103,6 +117,7 @@ decl_module! {
             Self::get_transfer_id_checked(transfer_hash, Kind::Transfer)?;
             Self::deposit_event(RawEvent::RelayMessage(transfer_hash));
 
+            <DailyLimits<T>>::mutate(from, |a| *a += amount);
             <TransferMessages<T>>::insert(transfer_hash, message);
             Ok(())
         }
@@ -297,6 +312,19 @@ decl_module! {
 
             Ok(())
         }
+
+        //close enough to clear it exactly at UTC 00:00 instead of BlockNumber
+        fn on_finalize() {
+            // clear accounts blocked day earlier (e.g. 18759 - 1)
+            let yesterday = Self::get_day_pair().0;
+            let is_first_day = Self::get_day_pair().1 == yesterday;
+            if <DailyBlocked<T>>::exists(&yesterday) && !is_first_day {
+                let blocked_yesterday = <DailyBlocked<T>>::get(&yesterday);
+                blocked_yesterday.iter().for_each(|a| <DailyLimits<T>>::remove(a));
+                <DailyBlocked<T>>::remove(&yesterday);
+            }
+            
+        }
     }
 }
 
@@ -343,6 +371,15 @@ impl<T: Trait> Module<T> {
         Ok(())
     }
 
+    ///get (yesterday,today) pair
+    fn get_day_pair() -> (T::Moment, T::Moment) {
+        let now = <timestamp::Module<T>>::get();
+        let day = T::Moment::sa(DAY);
+        let today = <timestamp::Module<T>>::get() / T::Moment::sa(DAY);
+        let yesterday = if now < day {T::Moment::sa(0)} else {<timestamp::Module<T>>::get()/day - T::Moment::sa(1)};
+        (yesterday, today)
+    }
+
     ///ensure that such transfer exist
     fn get_transfer_id_checked(transfer_hash: T::Hash, kind: Kind) -> Result {
         if !<TransferId<T>>::exists(transfer_hash) {
@@ -351,6 +388,7 @@ impl<T: Trait> Module<T> {
         Ok(())
     }
 
+    ///execute actual mint
     fn deposit(message: TransferMessage<T::AccountId, T::Hash>) -> Result {
         Self::sub_pending_mint(message.clone())?;
         let to = message.substrate_address;
@@ -474,6 +512,7 @@ impl<T: Trait> Module<T> {
 
         <token::Module<T>>::unlock(&from, message.amount)?;
         <token::Module<T>>::_burn(from.clone(), message.amount)?;
+        <DailyLimits<T>>::mutate(from.clone(), |a| *a -= message.amount);
 
         Self::deposit_event(RawEvent::BurnedMessage(
             message_id,
@@ -617,6 +656,31 @@ impl<T: Trait> Module<T> {
         Ok(())
     }
 
+    fn check_daily_account_volume(account: T::AccountId, amount: TokenBalance) -> Result {
+        let cur_pending = <DailyLimits<T>>::get(&account);
+        let cur_pending_account_limit = <CurrentLimits<T>>::get().day_max_limit_for_one_address;
+        let can_burn = cur_pending + amount < cur_pending_account_limit;
+
+        //store current day (like 18768)
+        let today = Self::get_day_pair().1;
+        let user_blocked = <DailyBlocked<T>>::get(&today)
+            .iter()
+            .any(|a| *a == account);
+
+        if !can_burn {
+            <DailyBlocked<T>>::mutate(today, |v| {
+                if !v.contains(&account) {
+                    v.push(account)
+                }
+            });
+        }
+        ensure!(
+            can_burn && !user_blocked,
+            "Transfer declined, user blocked due to daily volume limit."
+        );
+
+        Ok(())
+    }
     fn check_amount(amount: TokenBalance) -> Result {
         let max = <CurrentLimits<T>>::get().max_tx_value;
         let min = <CurrentLimits<T>>::get().min_tx_value;
@@ -629,7 +693,6 @@ impl<T: Trait> Module<T> {
             amount < max,
             "Invalid amount for transaction. Reached maximum limit."
         );
-
         Ok(())
     }
     //open transactions check
@@ -671,7 +734,7 @@ impl<T: Trait> Module<T> {
     fn check_daily_holds(message: TransferMessage<T::AccountId, T::Hash>) -> Result {
         let from = message.substrate_address;
         let first_tx = <DailyHolds<T>>::get(from.clone());
-        let daily_hold = T::BlockNumber::sa(DAY);
+        let daily_hold = T::BlockNumber::sa(DAY_IN_BLOCKS);
         let day_passed = first_tx.0 + daily_hold < T::BlockNumber::sa(0);
 
         if !day_passed {
@@ -697,12 +760,12 @@ impl<T: Trait> Module<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    //TODO: fix limits after adding them into config
     use primitives::{Blake2Hasher, H160, H256};
     use runtime_io::with_externalities;
     use runtime_primitives::{
         testing::{Digest, DigestItem, Header},
-        traits::{BlakeTwo256, IdentityLookup},
+        traits::{BlakeTwo256, IdentityLookup, OnFinalize},
         BuildStorage,
     };
     use support::{assert_noop, assert_ok, impl_outer_origin};
@@ -751,20 +814,41 @@ mod tests {
 
     type BridgeModule = Module<Test>;
     type TokenModule = token::Module<Test>;
+    type TimestampModule = timestamp::Module<Test>;
+    type System = system::Module<Test>;
 
     const ETH_MESSAGE_ID: &[u8; 32] = b"0x5617efe391571b5dc8230db92ba65b";
+    const ETH_MESSAGE_ID1: &[u8; 32] = b"0x5617iru391571b5dc8230db92ba65b";
     const ETH_MESSAGE_ID2: &[u8; 32] = b"0x5617yhk391571b5dc8230db92ba65b";
     const ETH_MESSAGE_ID3: &[u8; 32] = b"0x5617jdp391571b5dc8230db92ba65b";
     const ETH_MESSAGE_ID4: &[u8; 32] = b"0x5617kpt391571b5dc8230db92ba65b";
     const ETH_MESSAGE_ID5: &[u8; 32] = b"0x5617oet391571b5dc8230db92ba65b";
-    const ETH_MESSAGE_ID6: &[u8; 32] = b"0x5617uem391571b5dc8230db92ba65b";
+    const ETH_MESSAGE_ID6: &[u8; 32] = b"0x5617pey391571b5dc8230db92ba65b";
+    const ETH_MESSAGE_ID7: &[u8; 32] = b"0x5617jqu391571b5dc8230db92ba65b";
+    const ETH_MESSAGE_ID8: &[u8; 32] = b"0x5617pbt391571b5dc8230db92ba65b";
     const ETH_ADDRESS: &[u8; 20] = b"0x00b46c2526ebb8f4c9";
     const V1: u64 = 1;
     const V2: u64 = 2;
     const V3: u64 = 3;
     const V4: u64 = 4;
-    const USER1: u64 = 4;
-    const USER2: u64 = 5;
+    const USER1: u64 = 5;
+    const USER2: u64 = 6;
+    const USER3: u64 = 7;
+    const USER4: u64 = 8;
+    const USER5: u64 = 9;
+    const USER6: u64 = 10;
+    const USER7: u64 = 11;
+    const USER8: u64 = 12;
+    const USER9: u64 = 13;
+
+    //fast forward approximately
+    fn run_to_block(n: u64) {
+        while System::block_number() < n {
+            BridgeModule::on_finalize(System::block_number());
+            TimestampModule::set_timestamp(6 * n);
+            System::set_block_number(System::block_number() + 1);
+        }
+    }
 
     // This function basically just builds a genesis storage key/value store according to
     // our desired mockup.
@@ -774,6 +858,7 @@ mod tests {
             .unwrap()
             .0;
 
+        //specify balances chain_spec configuration
         r.extend(
             balances::GenesisConfig::<Test> {
                 balances: vec![
@@ -782,7 +867,7 @@ mod tests {
                     (V3, 100000),
                     (USER1, 100000),
                     (USER2, 300000),
-                ],
+                    ],
                 vesting: vec![],
                 transaction_base_fee: 0,
                 transaction_byte_fee: 0,
@@ -794,11 +879,13 @@ mod tests {
             .unwrap()
             .0,
         );
-
+        
+        //specify bridge chain_spec configuration
         r.extend(
             GenesisConfig::<Test> {
                 validators_count: 3u32,
                 validator_accounts: vec![V1, V2, V3],
+                current_limits: vec![100, 200, 50, 400, 1],
             }
             .build_storage()
             .unwrap()
@@ -813,7 +900,7 @@ mod tests {
         with_externalities(&mut new_test_ext(), || {
             let message_id = H256::from(ETH_MESSAGE_ID);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount = 99 * 10u128.pow(18);
+            let amount = 99;
 
             //substrate <----- ETH
             assert_ok!(BridgeModule::multi_signed_mint(
@@ -848,7 +935,7 @@ mod tests {
         with_externalities(&mut new_test_ext(), || {
             let message_id = H256::from(ETH_MESSAGE_ID);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount = 99 * 10u128.pow(18);
+            let amount = 99;
 
             //substrate <----- ETH
             assert_ok!(BridgeModule::multi_signed_mint(
@@ -888,26 +975,11 @@ mod tests {
     #[test]
     fn token_sub2eth_burn_works() {
         with_externalities(&mut new_test_ext(), || {
-            let eth_message_id = H256::from(ETH_MESSAGE_ID);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount1 = 99 * 10u128.pow(18);
-            let amount2 = 50 * 10u128.pow(18);
+            let amount1 = 600;
+            let amount2 = 49;
 
-            //substrate <----- ETH
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V2),
-                eth_message_id,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V1),
-                eth_message_id,
-                eth_address,
-                USER2,
-                amount1
-            ));
+            let _ = TokenModule::_mint(USER2, amount1);
 
             //substrate ----> ETH
             assert_ok!(BridgeModule::set_transfer(
@@ -917,7 +989,7 @@ mod tests {
             ));
             //RelayMessage(message_id) event emitted
 
-            let sub_message_id = BridgeModule::message_id_by_transfer_id(1);
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(0);
             let get_message = || BridgeModule::messages(sub_message_id);
 
             let mut message = get_message();
@@ -964,27 +1036,14 @@ mod tests {
         })
     }
     #[test]
-    fn token_sub2eth_burn_fail_skip_approval() {
+    fn token_sub2eth_burn_skipped_approval_should_fail() {
         with_externalities(&mut new_test_ext(), || {
-            let eth_message_id = H256::from(ETH_MESSAGE_ID);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount1 = 99 * 10u128.pow(18);
-            let amount2 = 50 * 10u128.pow(18);
-            //substrate <----- ETH
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V2),
-                eth_message_id,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V1),
-                eth_message_id,
-                eth_address,
-                USER2,
-                amount1
-            ));
+            let amount1 = 600;
+            let amount2 = 49;
+
+            let _ = TokenModule::_mint(USER2, amount1);
+
             assert_eq!(TokenModule::balance_of(USER2), amount1);
             assert_eq!(TokenModule::total_supply(), amount1);
 
@@ -996,7 +1055,7 @@ mod tests {
             ));
             //RelayMessage(message_id) event emitted
 
-            let sub_message_id = BridgeModule::message_id_by_transfer_id(1);
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(0);
             let message = BridgeModule::messages(sub_message_id);
             assert_eq!(message.status, Status::Withdraw);
 
@@ -1012,26 +1071,11 @@ mod tests {
     #[test]
     fn token_sub2eth_burn_cancel_works() {
         with_externalities(&mut new_test_ext(), || {
-            let eth_message_id = H256::from(ETH_MESSAGE_ID);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount1 = 99 * 10u128.pow(18);
-            let amount2 = 50 * 10u128.pow(18);
+            let amount1 = 600;
+            let amount2 = 49;
 
-            //substrate <----- ETH
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V2),
-                eth_message_id,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V1),
-                eth_message_id,
-                eth_address,
-                USER2,
-                amount1
-            ));
+            let _ = TokenModule::_mint(USER2, amount1);
 
             //substrate ----> ETH
             assert_ok!(BridgeModule::set_transfer(
@@ -1040,7 +1084,7 @@ mod tests {
                 amount2
             ));
 
-            let sub_message_id = BridgeModule::message_id_by_transfer_id(1);
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(0);
             assert_ok!(BridgeModule::approve_transfer(
                 Origin::signed(V1),
                 sub_message_id
@@ -1067,26 +1111,11 @@ mod tests {
     #[test]
     fn burn_cancel_should_fail() {
         with_externalities(&mut new_test_ext(), || {
-            let eth_message_id = H256::from(ETH_MESSAGE_ID);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount1 = 99 * 10u128.pow(18);
-            let amount2 = 50 * 10u128.pow(18);
+            let amount1 = 600;
+            let amount2 = 49;
 
-            //substrate <----- ETH
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V2),
-                eth_message_id,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V1),
-                eth_message_id,
-                eth_address,
-                USER2,
-                amount1
-            ));
+            let _ = TokenModule::_mint(USER2, amount1);
 
             //substrate ----> ETH
             assert_ok!(BridgeModule::set_transfer(
@@ -1095,7 +1124,7 @@ mod tests {
                 amount2
             ));
 
-            let sub_message_id = BridgeModule::message_id_by_transfer_id(1);
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(0);
             let get_message = || BridgeModule::messages(sub_message_id);
 
             let mut message = get_message();
@@ -1271,8 +1300,9 @@ mod tests {
         with_externalities(&mut new_test_ext(), || {
             let eth_message_id = H256::from(ETH_MESSAGE_ID);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount1 = 99 * 10u128.pow(18);
-            let amount2 = 90 * 10u128.pow(18);
+            let amount1 = 99;
+            let amount2 = 49;
+
             //substrate <----- ETH
             assert_ok!(BridgeModule::multi_signed_mint(
                 Origin::signed(V2),
@@ -1306,12 +1336,11 @@ mod tests {
                 sub_message_id
             ));
             // assert_noop BUG: fails through different root hashes
-            // assert_noop!(
-            //     BridgeModule::approve_transfer(Origin::signed(V2), sub_message_id),
-            //     "Cannot withdraw more that 75% of first day deposit."
-            // );
-            // signs the transfer, but fails further and marks message as Canceled
-            let _ = BridgeModule::approve_transfer(Origin::signed(V2), sub_message_id);
+            // solution: use assert_eq!(expr, Err("Error string")) explicitly
+            assert_eq!(
+                BridgeModule::approve_transfer(Origin::signed(V2), sub_message_id),
+                Err("Cannot withdraw more that 75% of first day deposit.")
+            );
 
             message = get_message();
             assert_eq!(message.status, Status::Canceled);
@@ -1320,16 +1349,13 @@ mod tests {
     #[test]
     fn change_limits_should_work() {
         with_externalities(&mut new_test_ext(), || {
-            let max_tx_value = 10 * 10u128.pow(18);
-            let day_max_limit = 20 * 10u128.pow(18);
-            let day_max_limit_for_one_address = 5 * 10u128.pow(18);
-            let max_pending_tx_limit = 40 * 10u128.pow(18);
-            let min_tx_value = 1 * 10u128.pow(18);
+            let max_tx_value = 10;
+            let day_max_limit = 20;
+            let day_max_limit_for_one_address = 5;
+            let max_pending_tx_limit = 40;
+            let min_tx_value = 1;
 
-            assert_eq!(
-                BridgeModule::current_limits().max_tx_value,
-                100 * 10u128.pow(18)
-            );
+            assert_eq!(BridgeModule::current_limits().max_tx_value, 100);
             assert_ok!(BridgeModule::update_limits(
                 Origin::signed(V2),
                 max_tx_value,
@@ -1347,25 +1373,18 @@ mod tests {
                 min_tx_value,
             ));
 
-            assert_eq!(
-                BridgeModule::current_limits().max_tx_value,
-                10 * 10u128.pow(18)
-            );
+            assert_eq!(BridgeModule::current_limits().max_tx_value, 10);
         })
     }
     #[test]
     fn change_limits_should_fail() {
         with_externalities(&mut new_test_ext(), || {
-            let day_max_limit = 20 * 10u128.pow(18);
-            let day_max_limit_for_one_address = 5 * 10u128.pow(18);
-            let max_pending_tx_limit = 40 * 10u128.pow(18);
-            let min_tx_value = 1 * 10u128.pow(18);
+            let day_max_limit = 20;
+            let day_max_limit_for_one_address = 5;
+            let max_pending_tx_limit = 40;
+            let min_tx_value = 1;
             const MORE_THAN_MAX: u128 = u128::max_value();
 
-            assert_eq!(
-                BridgeModule::current_limits().max_tx_value,
-                100 * 10u128.pow(18)
-            );
             assert_noop!(
                 BridgeModule::update_limits(
                     Origin::signed(V1),
@@ -1382,149 +1401,104 @@ mod tests {
     #[test]
     fn pending_burn_limit_should_work() {
         with_externalities(&mut new_test_ext(), || {
-            let eth_message_id = H256::from(ETH_MESSAGE_ID);
-            let eth_message_id2 = H256::from(ETH_MESSAGE_ID2);
-            let eth_message_id3 = H256::from(ETH_MESSAGE_ID3);
-            let eth_message_id4 = H256::from(ETH_MESSAGE_ID4);
-            let eth_message_id5 = H256::from(ETH_MESSAGE_ID5);
-            let eth_message_id6 = H256::from(ETH_MESSAGE_ID6);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount1 = 99 * 10u128.pow(18);
-            let amount2 = 50 * 10u128.pow(18);
-
-            //TODO: move limits to chain_spec
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V2),
-                eth_message_id,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V1),
-                eth_message_id,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            //& delete this afterwards
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V2),
-                eth_message_id2,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V1),
-                eth_message_id2,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V2),
-                eth_message_id3,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V1),
-                eth_message_id3,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V2),
-                eth_message_id4,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V1),
-                eth_message_id4,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V2),
-                eth_message_id5,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V1),
-                eth_message_id5,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V2),
-                eth_message_id6,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            assert_ok!(BridgeModule::multi_signed_mint(
-                Origin::signed(V1),
-                eth_message_id6,
-                eth_address,
-                USER2,
-                amount1
-            ));
-            // to delete ^
+            let amount1 = 60;
+            let amount2 = 49;
+            //TODO: pending transactions volume never reached if daily limit is lower
+            let _ = TokenModule::_mint(USER1, amount1);
+            let _ = TokenModule::_mint(USER2, amount1);
+            let _ = TokenModule::_mint(USER3, amount1);
+            let _ = TokenModule::_mint(USER4, amount1);
+            let _ = TokenModule::_mint(USER5, amount1);
+            let _ = TokenModule::_mint(USER6, amount1);
+            let _ = TokenModule::_mint(USER7, amount1);
+            let _ = TokenModule::_mint(USER8, amount1);
+            let _ = TokenModule::_mint(USER9, amount1);
+            //1
             assert_ok!(BridgeModule::set_transfer(
                 Origin::signed(USER2),
                 eth_address,
-                amount1
+                amount2
+            ));
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(0);
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER3),
+                eth_address,
+                amount2
+            ));
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(1);
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER4),
+                eth_address,
+                amount2
+            ));
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(2);
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER5),
+                eth_address,
+                amount2
+            ));
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(3);
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER6),
+                eth_address,
+                amount2
+            ));
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(4);
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER7),
+                eth_address,
+                amount2
+            ));
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(5);
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER8),
+                eth_address,
+                amount2
             ));
             let sub_message_id = BridgeModule::message_id_by_transfer_id(6);
             assert_ok!(BridgeModule::approve_transfer(
                 Origin::signed(V1),
                 sub_message_id
             ));
-            //TODO: delete
             assert_ok!(BridgeModule::set_transfer(
-                Origin::signed(USER2),
+                Origin::signed(USER9),
                 eth_address,
-                amount1 + 1
+                amount2
             ));
             let sub_message_id = BridgeModule::message_id_by_transfer_id(7);
             assert_ok!(BridgeModule::approve_transfer(
                 Origin::signed(V1),
                 sub_message_id
             ));
-            assert_ok!(BridgeModule::set_transfer(
-                Origin::signed(USER2),
-                eth_address,
-                amount1 + 2
-            ));
-            let sub_message_id = BridgeModule::message_id_by_transfer_id(8);
-            assert_ok!(BridgeModule::approve_transfer(
-                Origin::signed(V1),
-                sub_message_id
-            ));
-            assert_ok!(BridgeModule::set_transfer(
-                Origin::signed(USER2),
-                eth_address,
-                amount1 + 3
-            ));
-            let sub_message_id = BridgeModule::message_id_by_transfer_id(9);
-            assert_ok!(BridgeModule::approve_transfer(
-                Origin::signed(V1),
-                sub_message_id
-            ));
-            //TODO: delete ^
 
-            assert_eq!(BridgeModule::pending_burn_count(), amount1 * 4 + 6);
+            assert_eq!(BridgeModule::pending_burn_count(), amount2 * 8);
             assert_noop!(
-                BridgeModule::set_transfer(Origin::signed(USER2), eth_address, amount2),
+                BridgeModule::set_transfer(Origin::signed(USER1), eth_address, amount2),
                 "Too many pending burn transactions."
             );
         })
@@ -1533,12 +1507,16 @@ mod tests {
     fn pending_mint_limit_should_work() {
         with_externalities(&mut new_test_ext(), || {
             let eth_message_id = H256::from(ETH_MESSAGE_ID);
+            let eth_message_id1 = H256::from(ETH_MESSAGE_ID1);
             let eth_message_id2 = H256::from(ETH_MESSAGE_ID2);
             let eth_message_id3 = H256::from(ETH_MESSAGE_ID3);
             let eth_message_id4 = H256::from(ETH_MESSAGE_ID4);
             let eth_message_id5 = H256::from(ETH_MESSAGE_ID5);
+            let eth_message_id6 = H256::from(ETH_MESSAGE_ID6);
+            let eth_message_id7 = H256::from(ETH_MESSAGE_ID7);
+            let eth_message_id8 = H256::from(ETH_MESSAGE_ID8);
             let eth_address = H160::from(ETH_ADDRESS);
-            let amount1 = 99 * 10u128.pow(18);
+            let amount1 = 49;
 
             //substrate <----- ETH
             assert_ok!(BridgeModule::multi_signed_mint(
@@ -1554,8 +1532,8 @@ mod tests {
                 Origin::signed(V2),
                 eth_message_id2,
                 eth_address,
-                USER2,
-                amount1 + 1
+                USER3,
+                amount1
             ));
 
             //substrate <----- ETH
@@ -1563,8 +1541,8 @@ mod tests {
                 Origin::signed(V2),
                 eth_message_id3,
                 eth_address,
-                USER2,
-                amount1 + 2
+                USER4,
+                amount1
             ));
 
             //substrate <----- ETH
@@ -1572,22 +1550,125 @@ mod tests {
                 Origin::signed(V2),
                 eth_message_id4,
                 eth_address,
-                USER2,
-                amount1 + 3
+                USER5,
+                amount1
             ));
-            assert_eq!(BridgeModule::pending_mint_count(), amount1 * 4 + 6);
+            //substrate <----- ETH
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id5,
+                eth_address,
+                USER6,
+                amount1
+            ));
+            //substrate <----- ETH
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id6,
+                eth_address,
+                USER7,
+                amount1
+            ));
+            //substrate <----- ETH
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id7,
+                eth_address,
+                USER8,
+                amount1
+            ));
+            //substrate <----- ETH
+            assert_ok!(BridgeModule::multi_signed_mint(
+                Origin::signed(V2),
+                eth_message_id8,
+                eth_address,
+                USER9,
+                amount1
+            ));
+            assert_eq!(BridgeModule::pending_mint_count(), amount1 * 8);
 
             //substrate <----- ETH
             assert_noop!(
                 BridgeModule::multi_signed_mint(
                     Origin::signed(V2),
-                    eth_message_id5,
+                    eth_message_id1,
                     eth_address,
-                    USER2,
+                    USER1,
                     amount1 + 5
                 ),
                 "Too many pending mint transactions."
             );
+        })
+    }
+    #[test]
+    fn blocking_account_by_volume_should_work() {
+        with_externalities(&mut new_test_ext(), || {
+            let eth_address = H160::from(ETH_ADDRESS);
+            let amount1 = 600;
+            let amount2 = 49;
+            let _ = TokenModule::_mint(USER2, amount1);
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER2),
+                eth_address,
+                amount2
+            ));
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(0);
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V2),
+                sub_message_id
+            ));
+
+            assert_eq!(
+                BridgeModule::set_transfer(Origin::signed(USER2), eth_address, amount2),
+                Err("Transfer declined, user blocked due to daily volume limit.")
+            );
+        })
+    }
+    #[test]
+    fn blocked_account_unblocked_next_day_should_work() {
+        with_externalities(&mut new_test_ext(), || {
+            let eth_address = H160::from(ETH_ADDRESS);
+            let amount1 = 600;
+            let amount2 = 49;
+            run_to_block(DAY_IN_BLOCKS);
+
+            let _ = TokenModule::_mint(USER2, amount1);
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER2),
+                eth_address,
+                amount2
+            ));
+            let sub_message_id = BridgeModule::message_id_by_transfer_id(0);
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V1),
+                sub_message_id
+            ));
+            assert_ok!(BridgeModule::approve_transfer(
+                Origin::signed(V2),
+                sub_message_id
+            ));
+            assert_eq!(
+                BridgeModule::set_transfer(Origin::signed(USER2), eth_address, amount2),
+                Err("Transfer declined, user blocked due to daily volume limit.")
+            );
+
+            //user added to blocked vec
+            let blocked_vec: Vec<u64> = vec![USER2];
+            assert_eq!(BridgeModule::daily_blocked(1), blocked_vec);
+
+            run_to_block(DAY_IN_BLOCKS * 2);
+            run_to_block(DAY_IN_BLOCKS * 3);
+
+            //try again
+            assert_ok!(BridgeModule::set_transfer(
+                Origin::signed(USER2),
+                eth_address,
+                amount2
+            ));
         })
     }
 }

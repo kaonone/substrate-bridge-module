@@ -201,6 +201,13 @@ fn testnet_genesis(
 		bridge: Some(BridgeConfig {
 			validator_accounts: bridge_validators,
 			validators_count: 3u32,
+			current_limits: vec![
+				 100*10u128.pow(18),
+				 200*10u128.pow(18),
+				 50*10u128.pow(18),
+				400*10u128.pow(18),
+				10*10u128.pow(18),
+			]
 		}),
 	}
 }
@@ -339,6 +346,13 @@ fn akropolis_staging_genesis() -> GenesisConfig {
 		bridge: Some(BridgeConfig {
 			validator_accounts: bridge_validators,
 			validators_count: 3u32,
+			current_limits: vec![
+				 100*10u128.pow(18),
+				 200*10u128.pow(18),
+				 50*10u128.pow(18),
+				400*10u128.pow(18),
+				10*10u128.pow(18),
+			]
 		})
 	}
 }
