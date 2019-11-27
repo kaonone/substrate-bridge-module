@@ -9,7 +9,7 @@
 use crate::token;
 use crate::types::{
     BridgeMessage, BridgeTransfer, Kind, LimitMessage, Limits, MemberId, ProposalId, Status,
-    TokenBalance, TransferMessage,
+    TokenBalance, TransferMessage, ValidatorsMessage,
 };
 use parity_codec::Encode;
 use primitives::H160;
@@ -74,9 +74,10 @@ decl_storage! {
         DailyLimits get(daily_limits_by_account): map(T::AccountId) => TokenBalance;
         DailyBlocked get(daily_blocked): map(T::Moment) => Vec<T::AccountId>;
 
+        Quorum get(quorum): u64 = 2;
         ValidatorsCount get(validators_count) config(): u32 = 3;
         ValidatorVotes get(validator_votes): map(ProposalId, T::AccountId) => bool;
-        ValidatorHistory get(validator_history): map (T::Hash) => BridgeMessage<T::AccountId, T::Hash>;
+        ValidatorHistory get(validator_history): map (T::Hash) => ValidatorsMessage<T::AccountId, T::Hash>;
         Validators get(validators) build(|config: &GenesisConfig<T>| {
             config.validator_accounts.clone().into_iter()
             .map(|acc: T::AccountId| (acc, true)).collect::<Vec<_>>()
@@ -186,50 +187,24 @@ decl_module! {
             Self::_sign(validator, id)
         }
 
-        // each validator calls it to add new validator
-        fn add_validator(origin, address: T::AccountId) -> Result {
+        // each validator calls it to update whole set of validators
+        fn update_validator_list(origin, message_id: T::Hash, quorum: u64, new_validator_list: Vec<T::AccountId>) -> Result {
             let validator = ensure_signed(origin)?;
             Self::check_validator(validator.clone())?;
 
-            ensure!(<ValidatorsCount<T>>::get() < 100_000, "Validators maximum reached.");
-            let hash = ("add", &address).using_encoded(<T as system::Trait>::Hashing::hash);
-
-            if !<ValidatorHistory<T>>::exists(hash) {
-                let message = BridgeMessage {
-                    message_id: hash,
-                    account: address,
-                    action: Status::AddValidator,
-                    status: Status::AddValidator,
+            if !<ValidatorHistory<T>>::exists(message_id) {
+                let message = ValidatorsMessage {
+                    message_id,
+                    quorum,
+                    accounts: new_validator_list,
+                    action: Status::UpdateValidatorSet,
+                    status: Status::UpdateValidatorSet,
                 };
-                <ValidatorHistory<T>>::insert(hash, message);
-                Self::get_transfer_id_checked(hash, Kind::Validator)?;
+                <ValidatorHistory<T>>::insert(message_id, message);
+                Self::get_transfer_id_checked(message_id, Kind::Validator)?;
             }
 
-            let id = <TransferId<T>>::get(hash);
-            Self::_sign(validator, id)
-        }
-
-        // each validator calls it to remove new validator
-        fn remove_validator(origin, address: T::AccountId) -> Result {
-            let validator = ensure_signed(origin)?;
-            Self::check_validator(validator.clone())?;
-
-            ensure!(<ValidatorsCount<T>>::get() > 1, "Can not remove last validator.");
-
-            let hash = ("remove", &address).using_encoded(<T as system::Trait>::Hashing::hash);
-
-            if !<ValidatorHistory<T>>::exists(hash) {
-                let message = BridgeMessage {
-                    message_id: hash,
-                    account: address,
-                    action: Status::RemoveValidator,
-                    status: Status::RemoveValidator,
-                };
-                <ValidatorHistory<T>>::insert(hash, message);
-                Self::get_transfer_id_checked(hash, Kind::Validator)?;
-            }
-
-            let id = <TransferId<T>>::get(hash);
+            let id = <TransferId<T>>::get(message_id);
             Self::_sign(validator, id)
         }
 
@@ -354,7 +329,7 @@ impl<T: Trait> Module<T> {
             match transfer.kind {
                 Kind::Transfer => Self::execute_transfer(message)?,
                 Kind::Limits => Self::_update_limits(limit_message)?,
-                Kind::Validator => Self::manage_bridge(validator_message)?,
+                Kind::Validator => Self::manage_validator_list(validator_message)?,
                 Kind::Bridge => Self::manage_bridge(bridge_message)?,
             }
             transfer.open = false;
@@ -469,28 +444,18 @@ impl<T: Trait> Module<T> {
         Ok(())
     }
 
-    /// add validator
-    fn _add_validator(info: BridgeMessage<T::AccountId, T::Hash>) -> Result {
-        ensure!(
-            <ValidatorsCount<T>>::get() < MAX_VALIDATORS,
-            "Validators maximum reached."
-        );
-        <Validators<T>>::insert(info.account.clone(), true);
-        <ValidatorAccounts<T>>::mutate(|v| v.retain(|x| *x != info.account));
-        <ValidatorsCount<T>>::mutate(|x| *x += 1);
+    /// update validators list
+    fn manage_validator_list(info: ValidatorsMessage<T::AccountId, T::Hash>) -> Result {
+        let new_count = u32::sa(info.accounts.clone().len());
+        ensure!(new_count < MAX_VALIDATORS, "New validator list is exceeding allowed length.");
+        
+        <Quorum<T>>::put(info.quorum);
+        <ValidatorsCount<T>>::put(new_count);
+        info.accounts
+            .clone()
+            .iter()
+            .for_each(|v| <Validators<T>>::insert(v, true));
         Self::update_status(info.message_id, Status::Confirmed, Kind::Validator)
-    }
-
-    /// remove validator
-    fn _remove_validator(info: BridgeMessage<T::AccountId, T::Hash>) -> Result {
-        ensure!(
-            <ValidatorsCount<T>>::get() > 1,
-            "Can not remove last validator."
-        );
-        <Validators<T>>::remove(info.account);
-        <ValidatorsCount<T>>::mutate(|x| *x -= 1);
-        <ValidatorHistory<T>>::remove(info.message_id);
-        Ok(())
     }
 
     /// check votes validity
@@ -542,14 +507,6 @@ impl<T: Trait> Module<T> {
 
     fn manage_bridge(message: BridgeMessage<T::AccountId, T::Hash>) -> Result {
         match message.action {
-            Status::AddValidator => match message.status {
-                Status::Approved => Self::_add_validator(message),
-                _ => Err("Tried to add validator with non-supported status"),
-            },
-            Status::RemoveValidator => match message.status {
-                Status::Approved => Self::_remove_validator(message),
-                _ => Err("Tried to remove validator with non-supported status"),
-            },
             Status::PauseTheBridge => match message.status {
                 Status::Approved => Self::pause_the_bridge(message),
                 _ => Err("Tried to pause the bridge with non-supported status"),
@@ -1175,49 +1132,30 @@ mod tests {
         })
     }
     #[test]
-    fn add_validator_should_work() {
+    fn update_validator_list_should_work() {
         with_externalities(&mut new_test_ext(), || {
-            assert_ok!(BridgeModule::add_validator(Origin::signed(V2), V4));
+            let eth_message_id = H256::from(ETH_MESSAGE_ID);
+            const QUORUM: u64 = 3;
+
+            assert_ok!(BridgeModule::update_validator_list(
+                Origin::signed(V2),
+                eth_message_id,
+                QUORUM,
+                vec![V1, V2, V3, V4]
+            ));
             let id = BridgeModule::message_id_by_transfer_id(0);
             let mut message = BridgeModule::validator_history(id);
             assert_eq!(message.status, Status::Pending);
 
-            assert_ok!(BridgeModule::add_validator(Origin::signed(V1), V4));
+            assert_ok!(BridgeModule::update_validator_list(
+                Origin::signed(V1),
+                eth_message_id,
+                QUORUM,
+                vec![V1, V2, V3, V4]
+            ));
             message = BridgeModule::validator_history(id);
             assert_eq!(message.status, Status::Confirmed);
             assert_eq!(BridgeModule::validators_count(), 4);
-        })
-    }
-    #[test]
-    fn remove_validator_should_work() {
-        with_externalities(&mut new_test_ext(), || {
-            assert_ok!(BridgeModule::remove_validator(Origin::signed(V2), V3));
-            let id = BridgeModule::message_id_by_transfer_id(0);
-            let mut message = BridgeModule::validator_history(id);
-            assert_eq!(message.status, Status::Pending);
-
-            assert_ok!(BridgeModule::remove_validator(Origin::signed(V1), V3));
-            message = BridgeModule::validator_history(id);
-            assert_eq!(message.status, Status::Revoked);
-            assert_eq!(BridgeModule::validators_count(), 2);
-        })
-    }
-    #[test]
-    fn remove_last_validator_should_fail() {
-        with_externalities(&mut new_test_ext(), || {
-            assert_ok!(BridgeModule::remove_validator(Origin::signed(V2), V3));
-            assert_ok!(BridgeModule::remove_validator(Origin::signed(V1), V3));
-            assert_eq!(BridgeModule::validators_count(), 2);
-
-            //TODO: deal with two validators corner case
-            assert_ok!(BridgeModule::remove_validator(Origin::signed(V1), V2));
-            assert_ok!(BridgeModule::remove_validator(Origin::signed(V2), V2));
-            // ^ this guy probably will not sign his removal ^
-
-            assert_eq!(BridgeModule::validators_count(), 1);
-            // assert_noop BUG: fails through different root hashes
-            // assert_ok fails with corect error but the noop below fails with different root hashes
-            // assert_noop!(BridgeModule::remove_validator(Origin::signed(V1), V1), "Cant remove last validator");
         })
     }
     #[test]
