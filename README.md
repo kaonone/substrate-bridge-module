@@ -137,16 +137,21 @@ This guide will walk you through how to create an account and how to connect to 
     "decimals": "u16",
     "symbol": "Vec<u8>"
   },
+    "Limits": {
+      "max_tx_value": "u128",
+      "day_max_limit": "u128",
+      "day_max_limit_for_one_address": "u128",
+      "max_pending_tx_limit": "u128",
+      "min_tx_value": "u128",
+  },
   "Status": {
       "_enum":[
         "Revoked",
         "Pending",
         "PauseTheBridge",
         "ResumeTheBridge",
-        "AddValidator",
-        "RemoveValidator",
-        "ChangeMinTx",
-        "ChangeMaxTx",
+        "UpdateValidatorSet",
+        "UpdateLimits",
         "Deposit",
         "Withdraw",
         "Approved",
@@ -170,14 +175,20 @@ This guide will walk you through how to create an account and how to connect to 
       "direction": "Status"
   },
     "LimitMessage": {
-      "message_id": "H256",
-      "amount": "TokenBalance",
+      "id": "H256",
+      "limits": "Limits",
       "status": "Status",
-      "action": "Status"
   },
     "BridgeMessage": {
       "message_id": "H256",
       "account": "AccountId",
+      "status": "Status",
+      "action": "Status"
+  },
+    "ValidatorMessage": {
+      "message_id": "H256",
+      "quorum":"u64",
+      "accounts": "Vec<AccountId>",
       "status": "Status",
       "action": "Status"
   },
