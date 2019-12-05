@@ -35,6 +35,8 @@ decl_event!(
         CancellationConfirmedMessage(Hash),
         MintedMessage(Hash),
         BurnedMessage(Hash, AccountId, H160, TokenBalance),
+        AccountPausedMessage(Hash, AccountId),
+        AccountResumedMessage(Hash, AccountId),
     }
 );
 
@@ -296,9 +298,13 @@ decl_module! {
             if <DailyBlocked<T>>::exists(&yesterday) && !is_first_day {
                 let blocked_yesterday = <DailyBlocked<T>>::get(&yesterday);
                 blocked_yesterday.iter().for_each(|a| <DailyLimits<T>>::remove(a));
+                blocked_yesterday.iter().for_each(|a|{
+                    let hash = (<timestamp::Module<T>>::get(), a.clone()).using_encoded(<T as system::Trait>::Hashing::hash);
+                    Self::deposit_event(RawEvent::AccountResumedMessage(hash, a.clone()));
+                }
+                );
                 <DailyBlocked<T>>::remove(&yesterday);
             }
-            
         }
     }
 }
@@ -351,7 +357,11 @@ impl<T: Trait> Module<T> {
         let now = <timestamp::Module<T>>::get();
         let day = T::Moment::sa(DAY);
         let today = <timestamp::Module<T>>::get() / T::Moment::sa(DAY);
-        let yesterday = if now < day {T::Moment::sa(0)} else {<timestamp::Module<T>>::get()/day - T::Moment::sa(1)};
+        let yesterday = if now < day {
+            T::Moment::sa(0)
+        } else {
+            <timestamp::Module<T>>::get() / day - T::Moment::sa(1)
+        };
         (yesterday, today)
     }
 
@@ -447,8 +457,10 @@ impl<T: Trait> Module<T> {
     /// update validators list
     fn manage_validator_list(info: ValidatorsMessage<T::AccountId, T::Hash>) -> Result {
         let new_count = u32::sa(info.accounts.clone().len());
-        ensure!(new_count < MAX_VALIDATORS, "New validator list is exceeding allowed length.");
-        
+        ensure!(
+            new_count < MAX_VALIDATORS,
+            "New validator list is exceeding allowed length."
+        );
         <Quorum<T>>::put(info.quorum);
         <ValidatorsCount<T>>::put(new_count);
         info.accounts
@@ -620,14 +632,15 @@ impl<T: Trait> Module<T> {
 
         //store current day (like 18768)
         let today = Self::get_day_pair().1;
-        let user_blocked = <DailyBlocked<T>>::get(&today)
-            .iter()
-            .any(|a| *a == account);
+        let user_blocked = <DailyBlocked<T>>::get(&today).iter().any(|a| *a == account);
 
         if !can_burn {
             <DailyBlocked<T>>::mutate(today, |v| {
                 if !v.contains(&account) {
-                    v.push(account)
+                    v.push(account.clone());
+                    let hash = (<timestamp::Module<T>>::get(), account.clone())
+                        .using_encoded(<T as system::Trait>::Hashing::hash);
+                    Self::deposit_event(RawEvent::AccountPausedMessage(hash, account))
                 }
             });
         }
@@ -824,7 +837,7 @@ mod tests {
                     (V3, 100000),
                     (USER1, 100000),
                     (USER2, 300000),
-                    ],
+                ],
                 vesting: vec![],
                 transaction_base_fee: 0,
                 transaction_byte_fee: 0,
@@ -836,7 +849,6 @@ mod tests {
             .unwrap()
             .0,
         );
-        
         //specify bridge chain_spec configuration
         r.extend(
             GenesisConfig::<Test> {
