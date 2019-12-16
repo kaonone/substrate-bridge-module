@@ -13,7 +13,7 @@
 5. Transfer some Kovan test DAI to our Substrate-based chain.
 6. Transfer some DAI from our chain to your Ethereum account.
 
-It should be pretty obvious from this point.
+It should be pretty much straightforward at this point.
 If you hit any problems, please feel free to file an issue!
 
 <pre>
